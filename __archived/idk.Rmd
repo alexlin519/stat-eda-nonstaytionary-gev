@@ -1,0 +1,251 @@
+---
+title: "Baseflow Full EDA Report (1945-2012)"
+subtitle: "Temporal Aggregation and Spatial Coherence Analysis"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = TRUE)
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+library(leaflet)
+library(htmltools)
+
+# -------------------------------------------------------
+# DATA LOADING
+# -------------------------------------------------------
+# Ensure these files exist in your directory
+yearly_max <- rast("yearly_max_1945_2012.tif")
+nc_path <- "Gridded 1945-2012 Baseflow.nc"
+bf_stack <- rast(nc_path)["BASEFLOW"]
+
+# Pre-calc date information
+all_dates <- time(bf_stack)
+
+```
+
+## 1. Temporal Drift: Is the Region Getting Wetter?
+
+We analyze if the maximum baseflow intensity has increased over the 68-year period.
+
+```{r trend_analysis}
+# 1. Calculate the regional average of the yearly maximums
+# Using 'yearly_max' is efficient here
+regional_annual_max <- global(yearly_max, "mean", na.rm = TRUE)
+
+# 2. Create a dataframe for plotting
+df_trend <- data.frame(
+  Year = 1945:2012,
+  Max_Baseflow = regional_annual_max$mean
+)
+
+# 3. Plot with a trend line (Loess smoothing)
+ggplot(df_trend, aes(x = Year, y = Max_Baseflow)) +
+  geom_line(color = "steelblue", alpha = 0.5) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", fill = "pink") +
+  theme_minimal() +
+  labs(title = "Average Annual Maximum Baseflow (1945-2012)",
+       subtitle = "Aggregated across the Vancouver/PNW Region",
+       y = "Baseflow (mm/day)",
+       x = "Year")
+
+```
+
+---
+
+## 2. Spatial Coherence: The Event of Jan 15, 1997
+
+We test the hypothesis that **January 15, 1997** was a regionally coherent event where >65% of the region exceeded the 90th percentile flows.
+
+```{r spatial_coherence}
+# -------------------------------------------------------
+# 1. Define the Event
+# -------------------------------------------------------
+target_date_str <- "1997-01-15"
+event_idx <- which(as.Date(all_dates) == as.Date(target_date_str))
+
+if(length(event_idx) > 0) {
+  
+  # -------------------------------------------------------
+  # 2. Calculate the 90th Percentile Threshold (The "High Flow" Mark)
+  # Note: Calculating quantile on the full daily stack is heavy. 
+  # Ideally, do this once and save it. Here we compute it on the fly.
+  # -------------------------------------------------------
+  
+  # To save time for this report, we check if the threshold file exists, otherwise calculate
+  if(file.exists("bf_quantile_90.tif")) {
+    bf_q90 <- rast("bf_quantile_90.tif")
+  } else {
+    # WARNING: This app function takes time on large stacks!
+    # If too slow, use a smaller sample or load pre-computed stats.
+    bf_q90 <- quantile(bf_stack, probs = 0.90, na.rm=TRUE)
+    # writeRaster(bf_q90, "bf_quantile_90.tif") # Optional: save for later
+  }
+
+  # -------------------------------------------------------
+  # 3. Compare Event Day to Threshold
+  # -------------------------------------------------------
+  event_layer <- bf_stack[[event_idx]]
+  
+  # Create a Binary Map: 1 if Event > 90th Percentile, 0 otherwise
+  exceedance_map <- event_layer > bf_q90
+  
+  # Calculate Percentage of Area
+  global_exceedance <- global(exceedance_map, "mean", na.rm=TRUE) # Mean of 0/1 is the %
+  pct_area <- round(global_exceedance$mean * 100, 2)
+  
+  print(paste("On", target_date_str, pct_area, "% of the region exceeded the 90th percentile baseflow."))
+
+  # -------------------------------------------------------
+  # 4. Visualization
+  # -------------------------------------------------------
+  # Plot Side-by-Side
+  par(mfrow = c(1, 2))
+  
+  # Plot 1: Raw Baseflow
+  plot(event_layer, 
+       main = paste("Raw Baseflow:", target_date_str), 
+       col = viridis(100), 
+       range = c(0, max(values(event_layer), na.rm=T)))
+  
+  # Plot 2: Spatial Coherence (Binary)
+  plot(exceedance_map, 
+       main = "Exceedance of 90th Percentile", 
+       col = c("lightgrey", "red"), 
+       legend = FALSE)
+  legend("bottomright", legend = c("Normal", "> 90th Pctl"), fill = c("lightgrey", "red"))
+  
+  par(mfrow = c(1, 1)) # Reset
+  
+} else {
+  print("Event date not found in dataset.")
+}
+
+```
+
+---
+
+## 3. Interactive Maps (Leaflet)
+
+This map visualizes the specific event date.
+
+```{r interactive_map, eval=TRUE}
+# NOTE: eval=TRUE is required for this to show up!
+
+target_date_viz <- "1997-01-15"
+viz_idx <- which(as.Date(all_dates) == as.Date(target_date_viz))
+
+if (length(viz_idx) > 0) {
+  
+  layer_to_plot <- bf_stack[[viz_idx]]
+  
+  # Define palette
+  vals <- values(layer_to_plot, mat=FALSE)
+  # Cap the legend at 98th percentile to avoid outliers skewing colors
+  max_val <- quantile(vals, 0.98, na.rm=TRUE) 
+  
+  pal <- colorNumeric(c("#FFFFCC", "#41B6C4", "#0C2C84"), 
+                      domain = c(0, max_val),
+                      na.color = "transparent")
+
+  leaflet() %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addRasterImage(layer_to_plot, 
+                   colors = pal, 
+                   opacity = 0.8,
+                   project = TRUE, # IMPORTANT: Must project to Web Mercator
+                   maxBytes = 30 * 1024 * 1024) %>% # Increased size limit
+    addLegend(pal = pal, 
+              values = c(0, max_val),
+              title = paste("Baseflow (mm)<br>", target_date_viz))
+} else {
+  print("Date not available for mapping.")
+}
+
+```
+
+---
+
+## 4. Point Extraction (Location Specific)
+
+Extracting time series for a specific coordinate (e.g., approximate location of North Vancouver).
+
+```{r point_extraction}
+# 1. Define specific coordinates (Longitude, Latitude)
+# Example: North Vancouver / Capilano area
+target_lon <- -123.10
+target_lat <- 49.35
+target_vect <- vect(cbind(target_lon, target_lat), crs="+proj=longlat +datum=WGS84")
+
+# 2. Extract
+# Ensure coords are in same CRS as raster. If raster is projected, project the point.
+if (crs(bf_stack) != crs(target_vect)) {
+  target_vect <- project(target_vect, crs(bf_stack))
+}
+
+point_vals <- terra::extract(bf_stack, target_vect, ID=FALSE)
+
+# 3. Check if we hit NA (ocean). If so, search nearby.
+if (all(is.na(point_vals))) {
+  print("Selected point is NA (likely ocean). finding nearest land pixel...")
+  # Simple workaround: take nearest non-NA cell
+  cells <- nearby(bf_stack[[1]], cells=cellFromXY(bf_stack, xy=crds(target_vect)), distance=5000)
+  # (Requires more complex logic for nearest neighbor, usually manual adjustment is best)
+} 
+
+# 4. Plotting
+# Transpose result to a vector
+ts_data <- as.numeric(t(point_vals))
+
+df_point <- data.frame(
+  Date = all_dates,
+  Baseflow = ts_data
+) %>%
+  filter(!is.na(Baseflow))
+
+# Highlight the 1997 event
+event_val <- df_point %>% filter(Date == as.Date("1997-01-15"))
+
+ggplot(df_point, aes(x = Date, y = Baseflow)) +
+  geom_line(color = "darkgreen", linewidth = 0.5) +
+  # Add red dot for the event
+  geom_point(data = event_val, aes(x=Date, y=Baseflow), color="red", size=3) +
+  geom_text(data = event_val, aes(label="Jan 1997 Event", y=Baseflow), vjust=-1, color="red") +
+  theme_light() +
+  labs(title = paste("Local Baseflow Series"), 
+       subtitle = paste("Location: ", target_lat, "N, ", target_lon, "W"),
+       y = "Baseflow (mm)")
+
+```
+
+## 5. Record Breaker Map
+
+Years where the historic maximum occurred.
+
+```{r record_breaker}
+# Find the index (year) of the maximum value for every pixel
+year_of_max_idx <- app(yearly_max, which.max)
+
+# Adjust index to Year
+historic_max_years <- year_of_max_idx + 1944
+
+# Plot
+plot(historic_max_years, 
+     main = "Year of Historic Maximum Baseflow",
+     col = terra::map.pal("viridis", 10),
+     type = "continuous")
+
+```
+
+```
+
+```

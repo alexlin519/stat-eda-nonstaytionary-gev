@@ -1,0 +1,42 @@
+library(terra)
+library(dplyr)
+library(readr)
+
+# 1. Load the hydrological zone TIF
+# Replace with your actual file path
+zone_raster <- rast("Export (4).tif")
+
+# Quick plot to see what the TIF looks like natively
+plot(zone_raster, main = "Hydrological Zones")
+
+# 2. Load your station coordinates
+# Using your April 15 file which contains all 130 unique stations
+#station_coordinate_apr15.xlsx so not csv, so we will read it using readxl
+library(readxl)
+stations_df <- read_excel("station_coordinate_apr15.xlsx")
+
+# Create spatial points from the dataframe using WGS 1984 (EPSG:4326)
+stations_vect <- vect(stations_df, geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+
+# CRITICAL STEP: The TIF might be in a different projection (e.g., BC Albers).
+# We must project the station points to match the raster's CRS before plotting or extracting.
+stations_vect_proj <- project(stations_vect, crs(zone_raster))
+
+# 3. Plot the stations on top of the zone map
+# Plot a single testing station (e.g., the first one)
+plot(stations_vect_proj[1, ], col = "blue", pch = 16, cex = 1.5, add = TRUE)
+
+# Or plot all 130 stations at once to see the full distribution
+# plot(stations_vect_proj, col = "red", pch = 16, cex = 0.8, add = TRUE)
+
+# 4. Extract the zone data for all stations
+# This extracts the pixel value exactly where each of the 130 stations sits
+extracted_zones <- terra::extract(zone_raster, stations_vect_proj)
+
+# 5. Bind the extracted zone data back to your original dataframe
+# terra::extract returns a dataframe with an ID column and the raster value column
+stations_with_zones <- stations_df %>%
+  mutate(Hydro_Zone = extracted_zones[, 2])
+
+# View the results
+head(stations_with_zones)

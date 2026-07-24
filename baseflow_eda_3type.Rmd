@@ -1,0 +1,363 @@
+
+---
+title: "Baseflow Data Processing Report (1945-2012 Historical + Future RCPs)"
+subtitle: "Temporal Aggregation and Spatial Resolution Analysis"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+## 1. Temporal Drift: Is the Region Getting Wetter?
+
+First, we analyze if the maximum baseflow intensity has increased over the observed period and how it is projected to change under different emission pathways.
+
+```{r setup, include=FALSE}
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Load the processed yearly data
+yearly_max_hist <- rast("yearly_max_1945_2012.tif")
+monthly_max_hist <- rast("monthly_max_1945_2012.tif")
+
+yearly_max_rcp45 <- rast("yearly_max_RCP45_1945_2099.tif")
+monthly_max_rcp45<- rast("monthly_max_RCP45_1945_2099.tif")
+
+yearly_max_rcp85 <- rast("yearly_max_RCP85_1945_2099.tif")
+monthly_max_rcp85<- rast("monthly_max_RCP85_1945_2099.tif")
+
+
+# Define file paths with your updated filenames
+file_history <- "netCDF_data/Gridded 1945-2012 Baseflow.nc"
+files_rcp45 <- c(
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 1.nc",
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 3.nc", 
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 2.nc"
+)
+files_rcp85 <- c(
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 1.nc",
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 3.nc",
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 2.nc"
+)
+
+
+# Load the Daily NetCDF files (terra will stitch the vectors together)
+#take a bit of time
+bf_stack_hist <- rast(file_history)["BASEFLOW"]
+bf_stack_rcp45 <- rast(files_rcp45)["BASEFLOW"]
+bf_stack_rcp85 <- rast(files_rcp85)["BASEFLOW"]
+
+  
+
+num_layers <- nlyr(yearly_max_rcp45)
+# 2. Create a sequence of years
+start_year <- 1945
+years_seq <- start_year : (start_year + num_layers - 1)
+# 3. Assign the time attribute
+time(yearly_max_hist) <- as.Date(paste0(1945:2012, "-01-01"))
+time(yearly_max_rcp45) <- as.Date(paste0(years_seq, "-01-01"))
+time(yearly_max_rcp85) <- as.Date(paste0(years_seq, "-01-01"))
+
+# 1. Calculate the regional average of the yearly maximums
+regional_annual_max_hist <- global(yearly_max_hist, "mean", na.rm = TRUE)
+regional_annual_max_rcp45 <- global(yearly_max_rcp45, "mean", na.rm = TRUE)
+regional_annual_max_rcp85 <- global(yearly_max_rcp85, "mean", na.rm = TRUE)
+
+# 2. Create dataframes for plotting
+df_historic <- data.frame(Year = 1945:2012, Max_Baseflow = regional_annual_max_hist$mean, Scenario = "Historical")
+df_rcp45 <- data.frame(Year = 1945:2099, Max_Baseflow = regional_annual_max_rcp45$mean, Scenario = "RCP 4.5")
+df_rcp85 <- data.frame(Year = 1945:2099, Max_Baseflow = regional_annual_max_rcp85$mean, Scenario = "RCP 8.5")
+
+# Combine all three
+df_trend <- bind_rows(df_historic, df_rcp45, df_rcp85)
+
+#check the first few rows for 3 scenarios
+#use filter
+head(df_trend %>% filter(Scenario == "Historical"))
+head(df_trend %>% filter(Scenario == "RCP 4.5"))
+head(df_trend %>% filter(Scenario == "RCP 8.5"))
+
+
+```
+
+```{r 1.5}
+# 3. Plot with a trend line (Loess smoothing)
+ggplot(df_trend, aes(x = Year, y = Max_Baseflow, color = Scenario, fill = Scenario)) +
+  geom_line(alpha = 0.5) +
+  geom_point(alpha = 0.7) +
+  #geom_smooth(method = "loess") +
+  scale_color_manual(values = c("Historical" = "black", "RCP 4.5" = "steelblue", "RCP 8.5" = "darkred")) +
+  scale_fill_manual(values = c("Historical" = "grey", "RCP 4.5" = "lightblue", "RCP 8.5" = "pink")) +
+  theme_minimal() +
+  labs(title = "Average Annual Maximum Baseflow (1945-2099)",
+       subtitle = "Aggregated across the Region",
+       y = "Baseflow (mm/day)",
+       x = "Year")
+
+#seperate the plot into three plots for each scenario
+ggplot(df_trend, aes(x = Year, y = Max_Baseflow, color = Scenario, fill = Scenario)) +
+  geom_line(alpha = 0.5) +
+  geom_point() +
+  #geom_smooth(method = "loess") +
+  scale_color_manual(values = c("Historical" = "black", "RCP 4.5" = "steelblue", "RCP 8.5" = "darkred")) +
+  scale_fill_manual(values = c("Historical" = "grey", "RCP 4.5" = "lightblue", "RCP 8.5" = "pink")) +
+  theme_minimal() +
+  labs(title = "Average Annual Maximum Baseflow (1945-2099)",
+       subtitle = "Aggregated across the Vancouver/PNW Region (Including RCP Scenarios)",
+       y = "Baseflow (mm/day)",
+       x = "Year") +
+  facet_wrap(~ Scenario, ncol = 1)  
+
+```
+
+---
+
+## 2. Spatial Visualization (Snapshots)
+
+Let’s visualize the hydrology data for specific dates to ensure the spatial patterns look correct across all three datasets.
+
+```{r 2}
+# === HISTORICAL SNAPSHOTS ===
+target_dates_hist <- as.Date(c("1945-01-01", "1972-05-01", "1972-07-01", "1997-06-01"))
+indices_hist <- which(as.Date(time(bf_stack_hist)) %in% target_dates_hist)
+
+if (length(indices_hist) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in indices_hist) {
+    plot(bf_stack_hist[[i]], main = paste("Historic:", time(bf_stack_hist)[i]), col = topo.colors(50), axes = FALSE) 
+  }
+}
+
+# === RCP 4.5 SNAPSHOTS ===
+target_dates_future <- as.Date(c("2030-01-01", "2050-05-01", "2070-07-01", "2099-06-01"))
+indices_rcp45 <- which(as.Date(time(bf_stack_rcp45)) %in% target_dates_future)
+
+if (length(indices_rcp45) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in indices_rcp45) {
+    plot(bf_stack_rcp45[[i]], main = paste("RCP 4.5:", time(bf_stack_rcp45)[i]), col = topo.colors(50), axes = FALSE) 
+  }
+}
+
+# === RCP 8.5 SNAPSHOTS ===
+indices_rcp85 <- which(as.Date(time(bf_stack_rcp85)) %in% target_dates_future)
+
+if (length(indices_rcp85) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in indices_rcp85) {
+    plot(bf_stack_rcp85[[i]], main = paste("RCP 8.5:", time(bf_stack_rcp85)[i]), col = topo.colors(50), axes = FALSE) 
+  }
+}
+par(mfrow = c(1, 1)) # Reset
+
+```
+
+---
+
+## 3. Interactive Maps for Key Dates, a decent visualization that can compare the spatial patterns directly for the same time slice across the three dataset, or different time slices within the same dataset.
+```{r 3}
+library(leaflet)
+library(terra)
+library(htmltools)
+
+# 1. Define your list of target dates
+target_dates <- as.Date(c("2012-06-08", "2026-03-08", "2070-01-01"))
+
+# 2. Create a list to store the maps
+map_list <- lapply(target_dates, function(date_val) {
+  
+  # Extract layers for the specific date
+  get_layer <- function(stack, d) {
+    idx <- which(time(stack) == d)
+    if(length(idx) > 0) return(stack[[idx]]) else return(NULL)
+  }
+  
+  l_hist <- get_layer(bf_stack_hist, date_val)
+  l_45   <- get_layer(bf_stack_rcp45, date_val)
+  l_85   <- get_layer(bf_stack_rcp85, date_val)
+  
+  # Identify available groups
+  available_groups <- c()
+  valid_layers <- list()
+  
+  if(!is.null(l_hist)) {
+    available_groups <- c(available_groups, "Historical")
+    valid_layers$Historical <- l_hist
+  }
+  if(!is.null(l_45)) {
+    available_groups <- c(available_groups, "RCP 4.5")
+    valid_layers$RCP45 <- l_45
+  }
+  if(!is.null(l_85)) {
+    available_groups <- c(available_groups, "RCP 8.5")
+    valid_layers$RCP85 <- l_85
+  }
+  
+  # Determine max value for this specific date for color scaling
+  # (Ensures all buttons for THIS map share the same color logic)
+  max_val <- max(sapply(valid_layers, function(x) max(values(x), na.rm=TRUE)), na.rm=TRUE)
+  
+  pal_shared <- colorNumeric(
+    palette = c("#FFFFCC", "#41B6C4", "#0C2C84"), 
+    domain = c(0, max_val),
+    na.color = "transparent"
+  )
+  
+  # Build the Map
+  m <- leaflet() %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addControl(html = paste("<strong>Map Date:", date_val, "</strong>"), position = "topright")
+  
+  if(!is.null(l_hist)) m <- m %>% addRasterImage(l_hist, colors = pal_shared, opacity = 0.8, group = "Historical", project = FALSE)
+  if(!is.null(l_45))   m <- m %>% addRasterImage(l_45, colors = pal_shared, opacity = 0.8, group = "RCP 4.5", project = FALSE)
+  if(!is.null(l_85))   m <- m %>% addRasterImage(l_85, colors = pal_shared, opacity = 0.8, group = "RCP 8.5", project = FALSE)
+  
+  m <- m %>%
+    addLegend(pal = pal_shared, values = c(0, max_val), title = "Baseflow (mm)", position = "bottomright") %>%
+    addLayersControl(
+      baseGroups = available_groups,
+      options = layersControlOptions(collapsed = FALSE)
+    )
+  
+  return(m)
+})
+
+# 3. Render all maps in the R Markdown output
+tagList(map_list)
+```
+
+---
+
+## 4. Point Extraction Daily
+
+We extract a time series for a specific coordinate across all three datasets to compare the daily volatility.
+
+```{r 4}
+# 1. Find valid land coordinates
+first_layer <- yearly_max_hist[[1]]
+valid_points <- as.points(first_layer, values=TRUE, na.rm=TRUE)
+
+# 2. Pick a safe sample point
+idx <- min(1000, length(valid_points))
+sample_point <- valid_points[idx]
+coords <- crds(sample_point)
+
+print(paste("Extracting data for Lat:", round(coords[1,2], 2), "Lon:", round(coords[1,1], 2)))
+
+# 3. Extract time series for this location across all stacks
+point_vals_hist <- as.numeric(terra::extract(bf_stack_hist, sample_point, ID=FALSE))
+point_vals_rcp45 <- as.numeric(terra::extract(bf_stack_rcp45, sample_point, ID=FALSE))
+point_vals_rcp85 <- as.numeric(terra::extract(bf_stack_rcp85, sample_point, ID=FALSE))
+
+# 4. Create dataframes and combine
+ts_hist <- data.frame(Date = time(bf_stack_hist), Baseflow = point_vals_hist, Scenario = "Historical")
+ts_rcp45 <- data.frame(Date = time(bf_stack_rcp45), Baseflow = point_vals_rcp45, Scenario = "RCP 4.5")
+ts_rcp85 <- data.frame(Date = time(bf_stack_rcp85), Baseflow = point_vals_rcp85, Scenario = "RCP 8.5")
+
+point_ts_all <- bind_rows(ts_hist, ts_rcp45, ts_rcp85)
+
+# Filter out early anomalies if necessary (like 1945-01-01)
+point_ts_all <- point_ts_all %>% filter(Date >= as.Date("1945-02-02"))
+
+# 5. Plot Interactive Daily Series
+library(plotly)
+p_daily <- ggplot(point_ts_all, aes(x = Date, y = Baseflow, color = Scenario)) +
+  geom_line(alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = c("Historical" = "darkgreen", "RCP 4.5" = "steelblue", "RCP 8.5" = "darkred")) +
+  theme_light() +
+  labs(title = paste("Local Daily Baseflow Series (1945-2099)"), 
+       subtitle = paste("Coordinates:", round(coords[1,1], 2), ",", round(coords[1,2], 2)),
+       y = "Baseflow (mm)")
+
+ggplotly(p_daily)
+
+#seperate the plot into three plots for each scenario
+p_daily_facet <- ggplot(point_ts_all, aes(x = Date, y = Baseflow, color = Scenario)) +
+  geom_line(alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = c("Historical" = "darkgreen", "RCP 4.5" = "steelblue", "RCP 8.5" = "darkred")) +
+  theme_light() +
+  labs(title = paste("Local Daily Baseflow Series (1945-2099)"), 
+       subtitle = paste("Coordinates:", round(coords[1,1], 2), ",", round(coords[1,2], 2)),
+       y = "Baseflow (mm)") +
+  facet_wrap(~ Scenario, ncol = 1)
+
+ggplotly(p_daily_facet)
+
+```
+---
+
+## 5. Identifying the "Record Breaker" Year
+
+Which year actually held the highest baseflow pixel-wise for each scenario?
+
+```{r 5}
+# Find the index (year) of the maximum value for every pixel
+year_of_max_hist <- which.max(yearly_max_hist)
+historic_max_years <- year_of_max_hist + 1944
+
+year_of_max_45 <- which.max(yearly_max_rcp45)
+future_max_years_45 <- year_of_max_45 + 1944
+
+year_of_max_85 <- which.max(yearly_max_rcp85)
+future_max_years_85 <- year_of_max_85 + 1944
+
+par(mfrow = c(1, 3))
+plot(historic_max_years, main = "Historic Max Year", col = terrain.colors(68), axes = FALSE)
+plot(future_max_years_45, main = "RCP 4.5 Max Year", col = heat.colors(155), axes = FALSE)
+plot(future_max_years_85, main = "RCP 8.5 Max Year", col = heat.colors(155), axes = FALSE)
+par(mfrow = c(1, 1))
+
+```
+
+```{r 5.5}
+library(terra)
+library(leaflet)
+
+# Bin years into numeric decades
+decades_rast_hist <- floor(historic_max_years / 10) * 10
+decades_rast_45 <- floor(future_max_years_45 / 10) * 10
+decades_rast_85 <- floor(future_max_years_85 / 10) * 10
+
+# Create Color Palettes
+pal_hist <- colorNumeric(palette = c("#D73027", "#4575B4"), domain = range(values(decades_rast_hist), na.rm=TRUE), na.color = "transparent")
+pal_future <- colorNumeric(palette = "YlOrRd", domain = range(values(decades_rast_85), na.rm=TRUE), na.color = "transparent")
+
+# Create the Interactive Map with layers for all three
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  
+  addRasterImage(decades_rast_hist, colors = pal_hist, opacity = 0.8, group = "Historical Era") %>%
+  addRasterImage(decades_rast_45, colors = pal_future, opacity = 0.8, group = "RCP 4.5 Era") %>%
+  addRasterImage(decades_rast_85, colors = pal_future, opacity = 0.8, group = "RCP 8.5 Era") %>%
+  
+  addLegend(pal = pal_hist, values = values(decades_rast_hist), title = "Historic Era", position = "bottomright") %>%
+  addLegend(pal = pal_future, values = values(decades_rast_85), title = "Future Era (RCPs)", position = "bottomleft") %>%
+  
+  addLayersControl(
+    baseGroups = c("Historical Era", "RCP 4.5 Era", "RCP 8.5 Era"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+```
+
+---
+
+## 6. Statistical Distribution (Ridge Plot)
+
+Since you have the `monthly_max_1945_2012.tif`, you can visualize how the distribution of "maximums" shifts through the seasons.
+
+---
+
+## Summary of Findings to look for:
+
+1. **Topography Influence:** You should notice the highest values concentrated along the Coast Mountains and the Cascades, where orographic lift intensifies rainfall.
+2. **The 1990s/2000s Shift:** Check Section 1's trend line; many PNW models show a slight intensification of extreme events in the latter half of the 20th century.
+3. **Pixel Size:** Remember that your pixels are large enough to encompass entire small sub-watersheds, meaning these baseflow values represent a significant volume of water moving into the stream network.
+
+```
+

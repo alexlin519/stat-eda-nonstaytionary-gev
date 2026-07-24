@@ -1,0 +1,315 @@
+---
+title: "Baseflow Data Processing Report (1945-2012)"
+subtitle: "Temporal Aggregation and Spatial Resolution Analysis"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+## 1. Temporal Drift: Is the Region Getting Wetter?
+
+First, we analyze if the maximum baseflow intensity has increased over the 68-year period. This is a classic indicator of climate change impacts on groundwater and soil saturation.
+
+```{r setup, include=FALSE}
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Load the processed yearly data
+yearly_max <- rast("yearly_max_1945_2012.tif")
+monthly_max <- rast("monthly_max_1945_2012.tif")
+yearly_max_rcp45 <- rast("yearly_max_RCP45_1945_2099.tif")
+monthly_max_rcp45<- rast("monthly_max_RCP45_1945_2099.tif")
+yearly_max_rcp85 <- rast("yearly_max_RCP85_1945_2099.tif")
+monthly_max_rcp85<- rast("monthly_max_RCP85_1945_2099.tif")
+
+# 1. Calculate the regional average of the yearly maximums
+regional_annual_max <- global(yearly_max, "mean", na.rm = TRUE)
+
+
+nc_path <- "Gridded 1945-2012 Baseflow.nc"
+bf_stack <- rast(nc_path)["BASEFLOW"]
+# 2. Create a dataframe for plotting
+df_trend <- data.frame(
+  Year = 1945:2012,
+  Max_Baseflow = regional_annual_max$mean
+)
+
+```
+
+```{r 1.5}
+# 3. Plot with a trend line (Loess smoothing)
+ggplot(df_trend, aes(x = Year, y = Max_Baseflow)) +
+  geom_line(color = "steelblue", alpha = 0.5) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", fill = "pink") +
+  theme_minimal() +
+  labs(title = "Average Annual Maximum Baseflow (1945-2012)",
+       subtitle = "Aggregated across the Vancouver/PNW Region",
+       y = "Baseflow (mm/day)",
+       x = "Year")
+
+#show the plot
+
+```
+
+---
+
+## 2.Spatial Visualization (Snapshots)
+
+Let’s visualize the hydrology data for specific dates to ensure the spatial patterns look correct.
+
+```{r 2}
+# Define dates to plot
+target_dates <- as.Date(c("1945-01-01", "1972-05-01", "1972-07-01", "1997-06-01"))
+actual_times <- time(bf_stack)
+
+# Find indices matching these dates
+indices <- which(as.Date(actual_times) %in% target_dates)
+
+if (length(indices) > 0) {
+  par(mfrow = c(2, 2)) # 2x2 Grid
+  for (i in indices) {
+    plot(bf_stack[[i]], 
+         main = paste("Baseflow:", actual_times[i]),
+         col = topo.colors(50),
+         axes = FALSE) 
+  }
+  par(mfrow = c(1, 1)) # Reset
+} else {
+  print("Selected dates not found in the dataset.")
+}
+
+
+```
+
+---
+
+## 3. Interactive Maps for Key Dates
+
+```{r 3}
+library(terra)
+library(leaflet)
+n_wettest <- 2  # Number of wettest days to show
+target_date <- "1945-07-15"  # Specific date to plot
+
+# ============================================
+# Helper Function
+# ============================================
+create_baseflow_map <- function(layer, title_text) {
+  all_values <- terra::values(layer)
+  actual_range <- range(all_values, na.rm = TRUE)
+  domain_vals <- c(0, actual_range[2])
+  
+  pal <- leaflet::colorNumeric(c("#FFFFCC", "#41B6C4", "#0C2C84"), 
+                                domain = domain_vals,
+                                na.color = "transparent")
+  
+  leaflet::leaflet() %>%
+    leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
+    leaflet::addRasterImage(layer, 
+                            colors = pal, 
+                            opacity = 0.8,
+                            project = FALSE,
+                            maxBytes = 20 * 1024 * 1024) %>%
+    leaflet::addLegend(pal = pal, 
+                       values = all_values,
+                       title = title_text)
+}
+
+# ============================================
+# 1. Top N Wettest Days
+# ============================================
+# daily_means <- global(bf_stack, "mean", na.rm = TRUE)
+# top_indices <- order(daily_means$mean, decreasing = TRUE)[1:n_wettest]
+# top_dates <- time(bf_stack)[top_indices]
+# 
+# top_maps <- lapply(1:n_wettest, function(i) {
+#   layer <- bf_stack[[top_indices[i]]]
+#   map_title <- sprintf("Rank %d - %s", i, top_dates[i])
+#   create_baseflow_map(layer, map_title)
+# })
+# 
+# # Display all top maps
+# htmltools::tagList(top_maps)
+
+# ============================================
+# 2. Specific Date Map
+# ============================================
+specific_date <- as.Date(target_date)
+date_index <- which(time(bf_stack) == specific_date)
+
+if(length(date_index) > 0) {
+  cat("\n=== Specific Date Map ===\n")
+  cat(sprintf("Date: %s (Day %d)\n", specific_date, date_index))
+  #cat(sprintf("Mean flow: %.2f mm\n", daily_means$mean[date_index]))
+  
+  specific_layer <- bf_stack[[date_index]]
+  create_baseflow_map(specific_layer, paste("Baseflow on", specific_date))
+} else {
+  cat("\n⚠ Date", target_date, "not found in dataset\n")
+  cat("Available range:", as.character(min(time(bf_stack))), 
+      "to", as.character(max(time(bf_stack))), "\n")
+}
+```
+
+
+
+
+## 4.Point Extraction Daily
+
+We extract a time series for a specific coordinate. To ensure we don’t pick an ocean pixel (NA), we programmatically find a valid land pixel.
+
+```{r 4}
+
+# first_layer <- bf_stack[[1]]
+# valid_points <- as.points(first_layer, values=TRUE, na.rm=TRUE)
+# 
+# # 2. Pick a safe sample point (e.g., the 1000th valid point)
+# # Ensure we don't go out of bounds if the map is small
+# idx <- min(1000, length(valid_points))
+# sample_point <- valid_points[idx]
+# coords <- crds(sample_point)
+# 
+# print(paste("Extracting data for Lat:", round(coords[1,2], 2), 
+#             "Lon:", round(coords[1,1], 2)))
+
+# # 1. Find valid land coordinates (not NA) from the first layer
+#using the first layer of the yearly max to find valid land coordinates
+first_layer <- yearly_max[[1]]
+valid_points <- as.points(first_layer, values=TRUE, na.rm=TRUE)
+
+# 2. Pick a safe sample point (e.g., the 1000th valid point)
+# Ensure we don't go out of bounds if the map is small
+idx <- min(1000, length(valid_points))
+sample_point <- valid_points[idx]
+coords <- crds(sample_point)
+
+print(paste("Extracting data for Lat:", round(coords[1,2], 2), 
+            "Lon:", round(coords[1,1], 2)))
+# 3. Extract time series for this location
+point_vals <- terra::extract(bf_stack, sample_point, ID=FALSE) # returns a vector
+
+# 4. Create dataframe
+point_ts <- data.frame(
+  Date = time(bf_stack),
+  Baseflow = as.numeric(point_vals)
+)
+
+# 5. Plot
+ggplot(point_ts, aes(x = Date, y = Baseflow)) +
+  geom_line(color = "darkgreen", linewidth = 0.8) +
+  theme_light() +
+  labs(title = paste("Local Baseflow Series"), 
+       subtitle = paste("Coordinates:", round(coords[1,1], 2), ",", round(coords[1,2], 2)),
+       y = "Baseflow (mm)")
+
+#make the data start from 1945, so filter the data frame and plot again
+point_ts <- point_ts %>% filter(Date >= as.Date("1945-02-02") & Date <= as.Date("2012-12-31"))
+ggplot(point_ts, aes(x = Date, y = Baseflow)) +
+  geom_line(color = "darkgreen", linewidth = 0.8) +
+  theme_light() +
+  labs(title = paste("Local Baseflow Series (1945-2012)"), 
+       subtitle = paste("Coordinates:", round(coords[1,1], 2), ",", round(coords[1,2], 2)),
+       y = "Baseflow (mm)")
+
+#make the plot wider and there are a lot x value (days)
+library(plotly)
+p <- ggplot(point_ts, aes(x = Date, y = Baseflow)) +
+  geom_line(color = "darkgreen") +
+  theme_light()
+
+ggplotly(p) # This makes the plot interactive in your RStudio Viewer
+```
+
+---
+
+## 5. Identifying the "Record Breaker" Year
+
+Which year in the 1945–2012 record actually held the highest baseflow pixel-wise? This identifies specific historical storm events.
+
+```{r 5}
+# Find the index (year) of the maximum value for every pixel
+year_of_max <- which.max(yearly_max)
+
+# Convert indices to actual years
+# If index 1 is 1945, then Year = Index + 1944
+historic_max_years <- year_of_max + 1944
+
+plot(historic_max_years, 
+     main = "Year of Historic Maximum Baseflow",
+     col = terrain.colors(68),
+     axes = FALSE)
+
+```
+
+```{r 5.5}
+library(terra)
+library(leaflet)
+
+# ============================================================
+# 1. Prepare the Data (Same as before)
+# ============================================================
+# Ensure historic_max_years exists from your previous code
+# Bin years into numeric decades (e.g., 1956 -> 1950)
+decades_rast <- floor(historic_max_years / 10) * 10
+
+# Get the range of decades for the domain boundaries
+decade_range <- range(values(decades_rast), na.rm = TRUE)
+
+# ============================================================
+# 2. Create the Gradient Color Palette (Red -> Blue)
+# ============================================================
+# We switch to 'colorNumeric' for a continuous gradient.
+# We define the exact colors: Red for low values, Blue for high values.
+pal_gradient <- colorNumeric(
+  palette = c("#D73027", "#4575B4"), # Using slightly nicer hex codes for Red and Blue
+  # Alternatively, just use standard colors: palette = c("red", "blue"),
+  domain = decade_range,
+  na.color = "transparent"
+)
+
+# ============================================================
+# 3. Create the Interactive Map
+# ============================================================
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  
+  addRasterImage(
+    decades_rast,
+    colors = pal_gradient, # Use the new gradient palette
+    opacity = 0.8,
+    maxBytes = 20 * 1024 * 1024,
+    group = "Trend Gradient"
+  ) %>%
+  
+  addLegend(
+    pal = pal_gradient,
+    values = values(decades_rast), # Supply values so it knows the range
+    title = "Record-Breaking Era",
+    position = "bottomright",
+    # Keep the 's' suffix for readability
+    labFormat = labelFormat(suffix = "s"),
+    opacity = 1
+  )
+```
+---
+
+## 6. Statistical Distribution (Ridge Plot)
+
+Since you have the `monthly_max_1945_2012.tif`, you can visualize how the distribution of "maximums" shifts through the seasons.
+
+---
+
+## Summary of Findings to look for:
+
+1. **Topography Influence:** You should notice the highest values () concentrated along the Coast Mountains and the Cascades, where orographic lift intensifies rainfall.
+2. **The 1990s/2000s Shift:** Check Section 1's trend line; many PNW models show a slight intensification of extreme events in the latter half of the 20th century.
+3. **Pixel Size:** Remember that your  pixels are large enough to encompass entire small sub-watersheds, meaning these baseflow values represent a significant volume of water moving into the stream network.
+
+**Would you like me to help you write a script to extract the data for a specific city (like Vancouver or Seattle) and perform a Gumbel Distribution fit to calculate the 50-year and 100-year return levels?**

@@ -1,0 +1,100 @@
+---
+title: "Hydrologic Hotspot Analysis: Multi-Threshold Comparison"
+author: "Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(terra)
+library(viridis)
+library(RColorBrewer)
+
+```
+
+## 1. Data Loading
+
+We load the pre-calculated threshold maps for History and RCP 4.5. The time-series analysis (counting exceedances) has been performed externally.
+
+```{r load-threshold-maps}
+# Historical Thresholds
+t90_hist <- rast("threshold_90_history.tif")
+t95_hist <- rast("threshold_95_history.tif")
+t99_hist <- rast("threshold_99_history.tif")
+
+# RCP 4.5 Thresholds
+t90_rcp45 <- rast("threshold_90_rcp45.tif")
+t95_rcp45 <- rast("threshold_95_rcp45.tif")
+t99_rcp45 <- rast("threshold_99_rcp45.tif")
+
+# RCP 8.5 Thresholds (Future Work)
+# t90_rcp85 <- rast("threshold_90_rcp85.tif")
+# t95_rcp85 <- rast("threshold_95_rcp85.tif")
+# t99_rcp85 <- rast("threshold_99_rcp85.tif")
+
+head(t95_rcp45
+     
+     ,n=50)
+```
+
+
+## 2 Spatial Hotspot Analysis
+We count how many times each cell exceeded its 95th percentile over the 140-year record.
+
+```{r}
+
+```
+
+## 2. Spatial Visualization: History vs. RCP 4.5
+
+Below we compare the spatial distribution of the 95th percentile (as the primary POT baseline) between the two periods.
+
+```{r plot-95-comparison, fig.height=6, fig.width=10}
+par(mfrow = c(1, 2))
+
+plot(t95_hist, 
+     main = "History: 95th Percentile Threshold", 
+     col = viridis(100), 
+     plg = list(title = "Value"))
+
+plot(t95_rcp45, 
+     main = "RCP 4.5: 95th Percentile Threshold", 
+     col = viridis(100), 
+     plg = list(title = "Value"))
+
+```
+
+## 3. Threshold Magnitude Shift
+
+This reveals how much the "extreme" definition itself changes between the historical period and the RCP 4.5 projection.
+
+```{r calculate-diffs}
+# Magnitude Differences
+diff_90 <- t90_rcp45 - t90_hist
+diff_95 <- t95_rcp45 - t95_hist
+diff_99 <- t99_rcp45 - t99_hist
+
+# RCP 8.5 Magnitude Differences (Future Work)
+# diff_90_85 <- t90_rcp85 - t90_hist
+# diff_95_85 <- t95_rcp85 - t95_hist
+# diff_99_85 <- t99_rcp85 - t99_hist
+
+```
+
+```{r plot-magnitude-shifts, fig.height=5, fig.width=15}
+par(mfrow = c(1, 3))
+
+plot(diff_90, main = "Δ 90th Pctl (RCP4.5 - Hist)", col = brewer.pal(11, "RdBu"))
+plot(diff_95, main = "Δ 95th Pctl (RCP4.5 - Hist)", col = brewer.pal(11, "RdBu"))
+plot(diff_99, main = "Δ 99th Pctl (RCP4.5 - Hist)", col = brewer.pal(11, "RdBu"))
+
+```
+
+---
+
+### Analysis Notes
+
+* **Sensitivity:** Comparing the 90, 95, and 99 thresholds allows you to see if "moderate extremes" (90th) are shifting differently than "rare extremes" (99th).
+* **Hotspot Identification:** Regions where the difference maps show high positive values (dark red) indicate that the baseline for what constitutes an "extreme" event is rising significantly under climate change.
+* **Alignment:** Ensure all `.tif` files share the same Coordinate Reference System (CRS). You can check this using `crs(t95_hist)`.

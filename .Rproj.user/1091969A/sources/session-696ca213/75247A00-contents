@@ -1,0 +1,125 @@
+---
+title: "Hydrologic Data — Quick Intro"
+subtitle: "Gridded variables + Station streamflow, 1945–2099"
+author: "Pacific Northwest / Vancouver Region"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    theme: flatly
+  pdf_document:
+    toc: true
+    number_sections: true
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+We use **two datasets together** for flood/extreme-value modelling in the Pacific Northwest:
+
+1. **Gridded hydrologic variables** — daily NetCDF rasters on a 1/16° grid, multiple variables.
+2. **Station streamflow** — daily CSV per station, ~190 gauge / dam sites.
+
+Both cover the **Peace, Fraser, and Columbia basins** in British Columbia and span **1945–2099** under historical + RCP 4.5 + RCP 8.5 scenarios. The gridded variables provide *covariates*; the station streamflow provides the *response* for GEV modelling.
+
+---
+
+# Dataset 1 — Gridded Variables
+
+## Variables
+
+| Variable | Code | Units | What it represents |
+|---|---|---|---|
+| Baseflow | `BASEFLOW` | mm/day | Subsurface drainage to streams |
+| Runoff | `RUNOFF` | mm/day | Surface runoff |
+| Snow water equivalent | `SWE` | mm | Liquid water stored in snowpack |
+| Evapotranspiration | `EVAP` | mm/day | Total ET |
+| Soil moisture | `SOIL_MOIST` | mm | Per soil layer (typically 3) |
+| Precipitation | `PREC` | mm/day | Downscaled daily precip |
+| Glacier outputs | various | — | Glacier melt / area (VIC-GL) |
+
+Each is a 3-D NetCDF array `(lat, lon, time)`.
+
+## Coverage
+
+- **Spatial:** Peace, Fraser, Columbia basins.
+- **Temporal:** 1945–2012 (observation-based historical) and 1945–2099 (future projections).
+- **Scenarios used here:** historical + **CanESM2 RCP 4.5** + **CanESM2 RCP 8.5**.
+
+---
+
+# Dataset 2 — Station Streamflow
+
+## Format
+
+One CSV per station. Columns: `Date`, `PNWNAmet` (historical), then one column per GCM-scenario (e.g. `CanESM2_rcp45_r1i1p1`). Units: **m³/s**.
+
+## Coverage
+
+- **Locations:** ~190 sites — Water Survey of Canada gauges, USGS gauges, and dam / project sites.
+- **Temporal:** 1945–2012 (PNWNAmet) and 1945–2099 (GCM-driven).
+- **Important:** flows are **naturalised** at regulated sites (dams are not represented).
+
+## Coordinate file
+
+`station_coordinate_apr15.xlsx` — one row per station with `Location Code`, `Longitude`, `Latitude` (used to map stations to grid cells).
+
+---
+
+# Spatial Resolution
+
+## The grid
+
+Both gridded and station coordinates live on the same **0.0625° × 0.0625°** lat-lon grid.
+
+Near Vancouver (49.28° N):
+
+| Dimension | Calculation | Result |
+|---|---|---|
+| Pixel height (lat) | `0.0625° × 111 km` | **≈ 6.94 km** |
+| Pixel width (lon) | `0.0625° × 111 km × cos(49.28°)` | **≈ 4.53 km** |
+| Pixel area | `6.94 × 4.53` | **≈ 31.4 km²** |
+| Pixels per layer | full domain | **35,041** |
+
+```{r pixel-calc, eval=TRUE}
+res        <- 0.0625
+deg_to_km  <- 111
+lat        <- 49.28
+
+height_km  <- res * deg_to_km
+width_km   <- res * deg_to_km * cos(lat * pi / 180)
+area_km2   <- height_km * width_km
+
+data.frame(
+  Metric = c("Pixel height (km)", "Pixel width (km)", "Pixel area (km²)"),
+  Value  = round(c(height_km, width_km, area_km2), 2)
+)
+```
+
+> Latitude width is constant; longitude width shrinks going north because meridians converge.
+
+## Station neighbourhood
+
+For each station we take the **5 × 5 box of cells** centred on the station's grid cell — i.e. 25 cells covering ≈ **785 km²** around the gauge. This gives a robust local neighbourhood instead of relying on a single nearest-cell hit.
+
+---
+
+# Time Coverage at a Glance
+
+| Run | Start | End | Years |
+|---|---|---|---|
+| Historical (PNWNAmet) | 1945 | 2012 | 68 |
+| CanESM2 RCP 4.5 | 1945 | 2099 | 155 |
+| CanESM2 RCP 8.5 | 1945 | 2099 | 155 |
+
+So for each station/grid-cell we have up to **155 years × 365 days ≈ 56,575 daily values** per scenario per variable.
+
+The processing code (file lists, 5×5 mapping, top-9 representative value, block-maxima, GEV merge) is documented separately in the workflow Rmd.

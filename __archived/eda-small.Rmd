@@ -1,0 +1,320 @@
+
+---
+title: "Hydrologic Data Exploratory Analysis"
+author: "Hydrology Analyst"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load necessary libraries
+# We prioritize 'terra' over 'raster' for speed and modern spatial handling
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(ncdf4, terra, ggplot2, dplyr, tidyr, ggridges, viridis)
+
+# Set file path variable for easy changing later
+nc_file_path <- "Hydrologic Model Output 1945-2099.nc"
+
+```
+
+## 1. Data Loading and Metadata Inspection
+
+First, we load the NetCDF file and inspect the internal metadata to understand the dimensions and variables available.
+
+```{r load_data, message=FALSE}
+# Check if file exists
+if (!file.exists(nc_file_path)) {
+  stop("The NetCDF file was not found. Please check the file path.")
+}
+
+# Open connection for metadata inspection
+nc_data <- nc_open(nc_file_path)
+
+# Print basic file info
+# a bit too long
+#print(nc_data)
+
+```
+
+### 1.1 Variable and Time Extraction
+
+We verify the time units and calendar format to ensure dates are parsed correctly.
+
+```{r check_time}
+# Extract variable names
+vars <- attributes(nc_data$var)$names
+print(paste("Variables found:", paste(vars, collapse = ", ")))
+
+# Inspect time attributes
+
+time_units <- ncatt_get(nc_data, "time", "units")$value
+time_calendar <- ncatt_get(nc_data, "time", "calendar")$value
+
+print(paste("Time Units:", time_units))
+
+print(paste("Calendar:", time_calendar))
+
+
+# Close the ncdf4 connection (we will use terra for processing)
+nc_close(nc_data)
+
+```
+
+## 2. Load Spatial Raster Data
+
+We use the `terra` package here as it is significantly faster than `raster` for large NetCDF files.
+
+```{r load_terra}
+# Load the full dataset
+nc_raw <- rast(nc_file_path)
+
+# Extract only the BASEFLOW variable
+# Note: Ensure the variable name matches exactly what was found in Section 1
+var_name <- "BASEFLOW" 
+bf_stack <- nc_raw[var_name]
+
+# Verify the stack
+print(bf_stack)
+
+# Assign time if not automatically detected correctly
+# (Terra usually handles this, but this is a safeguard)
+if (all(is.na(time(bf_stack)))) {
+  # Logic to manually parse if necessary (based on Section 1 info)
+  # This part assumes standard CF-compliant NetCDF
+  warning("Time dimension not automatically detected. Check netCDF attributes.")
+}
+
+```
+
+## 3. Spatial Visualization (Snapshots)
+
+Let's visualize the hydrology data for specific dates to ensure the spatial patterns look correct.
+
+```{r plot_snapshots, fig.width=10, fig.height=8}
+# Define dates to plot
+target_dates <- as.Date(c("1945-01-01", "1945-05-01", "1945-07-01", "1946-01-01"))
+actual_times <- time(bf_stack)
+
+# Find indices matching these dates
+indices <- which(as.Date(actual_times) %in% target_dates)
+
+if (length(indices) > 0) {
+  par(mfrow = c(2, 2)) # 2x2 Grid
+  for (i in indices) {
+    plot(bf_stack[[i]], 
+         main = paste("Baseflow:", actual_times[i]),
+         col = topo.colors(50),
+         axes = FALSE) 
+  }
+  par(mfrow = c(1, 1)) # Reset
+} else {
+  print("Selected dates not found in the dataset.")
+}
+
+```
+
+## 4. Aggregate Spatial Analysis
+
+### 4.1 Total Accumulation
+
+We calculate the total baseflow accumulation for the entire duration of the file (pixel-wise sum).
+
+```{r spatial_sum}
+# Calculate sum across all time layers
+total_baseflow <- app(bf_stack, sum, na.rm = TRUE)
+
+plot(total_baseflow, 
+     main = "Total Baseflow Accumulation (Sum)", 
+     col = topo.colors(100),
+     axes = FALSE)
+
+```
+
+### 4.2 Spatial Statistics (Mean vs Volatility)
+
+We compare the average wetness against the standard deviation to identify areas that are consistently wet vs. those that are flashy (storm-driven).
+
+```{r mean_sd_map, fig.width=12}
+mean_map <- app(bf_stack, mean, na.rm = TRUE)
+sd_map   <- app(bf_stack, sd, na.rm = TRUE)
+
+par(mfrow = c(1, 2))
+plot(mean_map, main = "Average Baseflow", col = topo.colors(100), axes=FALSE)
+plot(sd_map,   main = "Volatility (Std Dev)", col = heat.colors(100), axes=FALSE)
+par(mfrow = c(1, 1))
+
+```
+
+## 5. Temporal Trends (Global)
+
+Here we aggregate the entire map into a single time series to see the seasonality of the whole region.
+
+```{r global_trend}
+# Calculate the global mean for every time step
+daily_avg <- global(bf_stack, "mean", na.rm = TRUE)
+
+# Prepare data for ggplot
+df_trend <- data.frame(
+  Date = time(bf_stack),
+  Baseflow_mm = daily_avg$mean
+)
+
+ggplot(df_trend, aes(x = Date, y = Baseflow_mm)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  theme_minimal() +
+  labs(title = "Region-Wide Average Daily Baseflow",
+       y = "Mean Baseflow (mm)",
+       x = "Date")
+
+```
+
+## 6. Local Analysis (Point Extraction)
+
+We extract a time series for a specific coordinate. To ensure we don't pick an ocean pixel (NA), we programmatically find a valid land pixel.
+
+```{r point_extraction}
+# 1. Find valid land coordinates (not NA) from the first layer
+first_layer <- bf_stack[[1]]
+valid_points <- as.points(first_layer, values=TRUE, na.rm=TRUE)
+
+# 2. Pick a safe sample point (e.g., the 1000th valid point)
+# Ensure we don't go out of bounds if the map is small
+idx <- min(1000, length(valid_points))
+sample_point <- valid_points[idx]
+coords <- crds(sample_point)
+
+print(paste("Extracting data for Lat:", round(coords[1,2], 2), 
+            "Lon:", round(coords[1,1], 2)))
+
+# 3. Extract time series for this location
+point_vals <- terra::extract(bf_stack, sample_point, ID=FALSE) # returns a vector
+
+# 4. Create dataframe
+point_ts <- data.frame(
+  Date = time(bf_stack),
+  Baseflow = as.numeric(point_vals)
+)
+
+# 5. Plot
+ggplot(point_ts, aes(x = Date, y = Baseflow)) +
+  geom_line(color = "darkgreen", linewidth = 0.8) +
+  theme_light() +
+  labs(title = paste("Local Baseflow Series"), 
+       subtitle = paste("Coordinates:", round(coords[1,1], 2), ",", round(coords[1,2], 2)),
+       y = "Baseflow (mm)")
+
+```
+
+## 7. Distribution Analysis
+
+We analyze the distribution of baseflow values across months.
+*Note: We sample the data spatially to ensure the plot renders quickly.*
+
+```{r ridge_plots, fig.height=8}
+# 1. Sample the data (e.g., 5000 random pixels across all time steps)
+# SpatSample with 'across=TRUE' is problematic for large time series memory-wise.
+# Strategy: Use the global daily averages to see seasonal shifts in magnitude.
+
+# Create a long format data frame for plotting
+df_long <- df_trend %>%
+  mutate(
+    Month = format(Date, "%B"),
+    Month_Num = as.numeric(format(Date, "%m"))
+  ) %>%
+  arrange(Month_Num) %>%
+  mutate(Month = factor(Month, levels = unique(Month)))
+
+
+library(ggridges)
+# Plot Ridge Density
+ggplot(df_long, aes(x = Baseflow_mm, y = Month, fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 1.1, rel_min_height = 0.01) +
+  scale_fill_viridis_c(name = "mm", option = "C") +
+  labs(title = "Monthly Distribution of Regional Mean Baseflow",
+       subtitle = "How the daily regional average changes shape per month",
+       x = "Baseflow (mm)") +
+  theme_ridges() + 
+  theme(legend.position = "none")
+
+```
+
+
+
+
+## 8. Interactive Maps for Key Dates
+```{r interactive_maps, fig.width=10, fig.height=8}
+
+library(terra)
+library(leaflet)
+n_wettest <- 2  # Number of wettest days to show
+target_date <- "1945-07-15"  # Specific date to plot
+
+# ============================================
+# Helper Function
+# ============================================
+create_baseflow_map <- function(layer, title_text) {
+  all_values <- terra::values(layer)
+  actual_range <- range(all_values, na.rm = TRUE)
+  domain_vals <- c(0, actual_range[2])
+  
+  pal <- leaflet::colorNumeric(c("#FFFFCC", "#41B6C4", "#0C2C84"), 
+                                domain = domain_vals,
+                                na.color = "transparent")
+  
+  leaflet::leaflet() %>%
+    leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
+    leaflet::addRasterImage(layer, 
+                            colors = pal, 
+                            opacity = 0.8,
+                            project = FALSE,
+                            maxBytes = 20 * 1024 * 1024) %>%
+    leaflet::addLegend(pal = pal, 
+                       values = all_values,
+                       title = title_text)
+}
+
+# ============================================
+# 1. Top N Wettest Days
+# ============================================
+daily_means <- global(bf_stack, "mean", na.rm = TRUE)
+top_indices <- order(daily_means$mean, decreasing = TRUE)[1:n_wettest]
+top_dates <- time(bf_stack)[top_indices]
+
+top_maps <- lapply(1:n_wettest, function(i) {
+  layer <- bf_stack[[top_indices[i]]]
+  map_title <- sprintf("Rank %d - %s", i, top_dates[i])
+  create_baseflow_map(layer, map_title)
+})
+
+# Display all top maps
+htmltools::tagList(top_maps)
+
+```
+
+```{r}
+# ============================================
+# 2. Specific Date Map
+# ============================================
+specific_date <- as.Date(target_date)
+date_index <- which(time(bf_stack) == specific_date)
+
+if(length(date_index) > 0) {
+  cat("\n=== Specific Date Map ===\n")
+  cat(sprintf("Date: %s (Day %d)\n", specific_date, date_index))
+  cat(sprintf("Mean flow: %.2f mm\n", daily_means$mean[date_index]))
+  
+  specific_layer <- bf_stack[[date_index]]
+  create_baseflow_map(specific_layer, paste("Baseflow on", specific_date))
+} else {
+  cat("\n⚠ Date", target_date, "not found in dataset\n")
+  cat("Available range:", as.character(min(time(bf_stack))), 
+      "to", as.character(max(time(bf_stack))), "\n")
+}
+```

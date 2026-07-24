@@ -1,0 +1,18 @@
+"0","if(nrow(internal_specks) > 0) {"
+"0","  # Convert speck coordinates to points for clear visibility on the map"
+"0","  points(internal_specks$x, internal_specks$y, col=""red"", pch=20, cex=0.5)"
+"0","}"
+"0",""
+"0","# 5. Output Results"
+"0","# ---------------------------------------------------------"
+"0","cat(""### QA Summary: Internal Gaps\n"")"
+"1","### QA Summary: Internal Gaps
+"
+"0","if (nrow(internal_specks) == 0) {"
+"0","  cat(""Success: No internal data gaps (specks) found within the study area.\n"")"
+"0","} else {"
+"0","  cat(""Detected"", nrow(internal_specks), ""pixels with intermittent missing data.\n"")"
+"0","  kable(head(internal_specks, 10), caption = ""Top 10 pixels with the most frequent internal gaps."")"
+"0","}"
+"1","Success: No internal data gaps (specks) found within the study area.
+"

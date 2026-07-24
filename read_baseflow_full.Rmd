@@ -1,0 +1,307 @@
+
+---
+title: "Baseflow Data Processing Report (1945-2012)"
+subtitle: "Temporal Aggregation and Spatial Resolution Analysis"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(terra)
+
+```
+
+
+## Overview
+
+This report documents the analysis of gridded baseflow data from 1945 to 2012 for the Vancouver/Pacific Northwest region. The workflow calculates monthly and yearly maximum baseflow values from daily NetCDF data using an optimized incremental processing approach.
+
+**Data Characteristics:**
+
+- Variable: BASEFLOW (mm/day)
+- Temporal Coverage: 1945-2012 (68 years)
+- Spatial Resolution: 0.0625° × 0.0625° (1/16 degree grid)
+- Coordinate System: WGS 84 (EPSG:4326)
+- Region: Vancouver/Pacific Northwest
+
+**Output Products:**
+
+- Monthly maximum baseflow: 816 layers (68 years × 12 months)
+- Yearly maximum baseflow: 68 layers (one per year)
+
+## Spatial Resolution Details
+
+The data is recorded on a 1/16 degree grid, where each pixel is exactly 0.0625° in both latitude and longitude.
+
+**Physical dimensions near Vancouver (49.28°N):**
+
+- **Latitude (Height)**: 0.0625° × 111 km ≈ **6.94 km**
+  - This dimension remains constant regardless of latitude
+  
+- **Longitude (Width)**: 0.0625° × 111 km × cos(49.28°) ≈ **4.53 km**
+  - This dimension decreases as you move northward due to meridian convergence
+  
+- **Pixel Area**: Approximately **31.4 km²** per pixel in the Vancouver region
+
+- **Total Pixel Count**: The dataset contains 35,041 pixels per layer (calculated from the spatial extent and resolution).
+## Processing Strategy
+
+The analysis employs a two-stage aggregation strategy to optimize memory usage and computational efficiency:
+
+**Stage A: Daily → Monthly Maximum**
+
+This is the computationally intensive step, processing up to 31 daily layers per month.
+
+**Stage B: Monthly → Yearly Maximum**
+
+This is extremely fast because it only processes 12 monthly layers per year instead of 365 daily layers.
+
+The data is processed in decade-long chunks (10-year groups) to manage memory constraints.
+
+## save the final outputs as GeoTIFFs for easy sharing and visualization in GIS software.
+The name of the output files are:
+- `monthly_max_1945_2012.tif`
+- `yearly_max_1945_2012.tif`
+
+```{r data info}
+# > print(final_yearly_max)
+# class       : SpatRaster 
+# size        : 367, 496, 68  (nrow, ncol, nlyr)
+# resolution  : 0.0625, 0.0625  (x, y)
+# extent      : -140, -109, 41.0625, 64  (xmin, xmax, ymin, ymax)
+# coord. ref. : lon/lat WGS 84 (EPSG:4326) 
+# source      : yearly_max_1945_2012.tif 
+# names       :         1945,         1946,         1947,         1948,         1949,         1950, ... 
+# min values  : 2.734829e-06, 2.734829e-06, 2.734829e-06, 2.734829e-06, 2.734829e-06, 2.734829e-06, ... 
+# max values  : 1.680794e+02, 6.995869e+01, 7.105131e+01, 7.759936e+01, 8.262132e+01, 8.449879e+01, ... 
+# > print(res(final_yearly_max))
+# [1] 0.0625 0.0625
+#The variable is BASEFLOW from a NetCDF file, representing the annual maximum 
+#for each pixel from 1945–2012. The unit is mm/day. The region is Vancouver/PNW.
+
+
+```
+## 1. Introduction and Setup
+
+This report documents the processing of gridded baseflow data from 1945 to 2012. The objective is to aggregate daily NetCDF data into **Monthly Maximum** and **Yearly Maximum** raster stacks.
+
+To handle the large temporal range efficiently, we utilize `terra`'s memory management options and process the data in 10-year incremental chunks.
+
+```{r load-data}
+# 1. Setup and Memory Management
+terraOptions(memmax = 0.4, progress = 10) 
+
+# Define input path and load reference
+nc_path <- "Gridded 1945-2012 Baseflow.nc"
+
+# Note: We load the source lazily using rast()
+bf_stack <- rast(nc_path)["BASEFLOW"]
+
+# Get unique years to create processing groups
+all_years <- unique(format(time(bf_stack), "%Y"))
+
+# Split years into groups of 10 to optimize memory usage
+year_groups <- split(all_years, ceiling(seq_along(all_years) / 10))
+
+# Initialize storage lists
+monthly_max_list <- list()
+yearly_max_list <- list()
+
+```
+
+## 2. Optimized Incremental Processing
+
+The following loop iterates through the defined year groups.
+
+**Methodology:**
+
+1. **Step A (Monthly Max):** We calculate the maximum daily value for every month. This is the most computationally intensive step.
+2. **Step B (Yearly Max):** We derive the yearly maximum *from the monthly results*. This is significantly faster than reprocessing the daily data, as it reduces the operation from ~365 layers/year to just 12 layers/year.
+
+```{r processing-loop, eval=FALSE}
+# print("Starting Optimized Incremental Processing...")
+# 
+# for (i in seq_along(year_groups)) {
+#   current_years <- year_groups[[i]]
+#   print(paste0("Processing Group ", i, "/", length(year_groups), 
+#                " (Years: ", min(current_years), "-", max(current_years), ")"))
+#   
+#   # 1. Subset Raw Data for the current time window
+#   sub_stack <- bf_stack[[format(time(bf_stack), "%Y") %in% current_years]]
+#   
+#   # ---------------------------------------------------------
+#   # STEP A: Calculate Monthly Max (The Heavy Lift)
+#   # ---------------------------------------------------------
+#   # Create index YYYY-MM
+#   idx_monthly <- format(time(sub_stack), "%Y-%m")
+#   
+#   # Tapp 1: Raw Daily -> Monthly Max
+#   chunk_monthly <- tapp(sub_stack, index = idx_monthly, fun = max, na.rm = TRUE)
+#   monthly_max_list[[i]] <- chunk_monthly
+#   
+#   # ---------------------------------------------------------
+#   # STEP B: Calculate Yearly Max (The Shortcut)
+#   # ---------------------------------------------------------
+#   # Extract year ("1945") from the monthly indices
+#   unique_months <- unique(idx_monthly)
+#   idx_yearly_from_month <- substr(unique_months, 1, 4)
+#   
+#   # Tapp 2: Monthly Max -> Yearly Max
+#   chunk_yearly <- tapp(chunk_monthly, index = idx_yearly_from_month, fun = max, na.rm = TRUE)
+#   yearly_max_list[[i]] <- chunk_yearly
+#   
+#   # ---------------------------------------------------------
+#   # Cleanup
+#   rm(sub_stack, chunk_monthly, chunk_yearly)
+#   gc() 
+# }
+# 
+# print("Loop finished. Ready to combine.")
+
+```
+
+## 3. Combining and Saving Results
+
+The processed chunks are combined into final raster stacks and exported as GeoTIFFs.
+
+### 3.1 Process Monthly Maximums
+
+```{r save-monthly, eval=FALSE}
+#final_monthly_max <- rast(monthly_max_list)
+# writeRaster(final_monthly_max, "monthly_max_1945_2012.tif", overwrite = TRUE)
+# print("Saved: monthly_max_1945_2012.tif")
+
+```
+
+### 3.2 Process Yearly Maximums
+
+```{r save-yearly, eval=FALSE}
+# final_yearly_max <- rast(yearly_max_list)
+# 
+# # Verify layer count matches year count
+# if (nlyr(final_yearly_max) == length(all_years)) {
+#   names(final_yearly_max) <- all_years
+# } else {
+#   warning("Layer count mismatch on yearly stack.")
+# }
+# 
+# writeRaster(final_yearly_max, "yearly_max_1945_2012.tif", overwrite = TRUE)
+# print("Saved: yearly_max_1945_2012.tif")
+
+```
+
+## 4. Verification and Spatial Analysis
+
+### 4.1 Data Structure Verification
+
+We perform a final check on the output dimensions to ensure the years 1945–2012 are fully represented.
+
+```{r verification, eval=FALSE}
+#read the tif files we just created
+final_monthly_max <- rast("monthly_max_1945_2012.tif")
+final_yearly_max <- rast("yearly_max_1945_2012.tif")
+# Check structure
+print(final_yearly_max)
+
+# Print the last 10 years to verify temporal coverage
+print(tail(names(final_yearly_max), 10))
+
+```
+
+### 4.2 Resolution and Grid Analysis
+
+The dataset uses a WGS 84 Coordinate Reference System. The resolution is confirmed to be **1/16th degree**.
+
+```{r spatial-check}
+# Resolution check
+res_val <- res(bf_stack)
+print(paste("Resolution:", res_val[1], "degrees"))
+
+# Coordinate System
+print(crs(bf_stack, describe = TRUE)$name)
+
+```
+
+### 4.3 Physical Area Calculation (Vancouver Context)
+
+Given the resolution of  (), we calculate the physical dimensions of a pixel for the region of interest (Vancouver/PNW, approx. latitude  N).
+
+**1. Height (Latitude):**
+The distance between degrees of latitude is approximately constant.
+
+**2. Width (Longitude):**
+The distance between degrees of longitude varies by the cosine of the latitude.
+
+**3. Total Pixel Area:**
+Therefore, each pixel in the Vancouver region covers an approximate area of:
+
+### 4.4 Unit Verification
+
+The variable `BASEFLOW` represents the annual maximum for each pixel.
+
+```{r units}
+# Check units of the raw stack
+#show only first several layers to avoid overwhelming output
+
+#print(paste("Data Units:", units(bf_stack)))
+print(paste("Units of first layer:", units(bf_stack[[1]])))
+
+```
+
+## 5. Missing Value Analysis (QA/QC)
+This section analyzes the integrity of the raw data by identifying NA (missing) values across three dimensions: total count, temporal distribution (by month/year), and spatial distribution (by pixel location).
+```{r}
+# library(terra)
+# library(dplyr)
+# library(knitr)
+# 
+# # 1. Define the Master Study Area Footprint
+# # ---------------------------------------------------------
+# # A pixel is "Inside" if it has > 0 valid observations over the entire 68 years.
+# # This creates a single-layer mask where 1 = Study Area, NA = True Background.
+# master_footprint <- sum(!is.na(final_monthly_max)) > 0
+# master_footprint[master_footprint == 0] <- NA 
+# 
+# # 2. Find Gaps (Holes)
+# # ---------------------------------------------------------
+# # We calculate how many layers are missing for each pixel THAT IS INSIDE the footprint.
+# # is.na(final_monthly_max) returns 1 for NA, 0 for value.
+# # We multiply by the master_footprint to ignore the "Ocean/Background".
+# gap_counts <- sum(is.na(final_monthly_max)) * master_footprint
+# 
+# # 3. Spatial Analysis: Locating the "Specks"
+# # ---------------------------------------------------------
+# holes_df <- as.data.frame(gap_counts, xy = TRUE)
+# colnames(holes_df)[3] <- "missing_months"
+# 
+# # Real holes are pixels inside the footprint that have at least 1 missing month
+# internal_specks <- holes_df %>%
+#   filter(!is.na(missing_months)) %>%
+#   filter(missing_months > 0) %>%
+#   arrange(desc(missing_months))
+# 
+# # 4. Visualization
+# # ---------------------------------------------------------
+# # Plot the footprint in light grey and the holes in red
+# plot(master_footprint, col="grey90", main="Internal Data Gaps (Red Specks)", legend=FALSE)
+# if(nrow(internal_specks) > 0) {
+#   # Convert speck coordinates to points for clear visibility on the map
+#   points(internal_specks$x, internal_specks$y, col="red", pch=20, cex=0.5)
+# }
+# 
+# # 5. Output Results
+# # ---------------------------------------------------------
+# cat("### QA Summary: Internal Gaps\n")
+# if (nrow(internal_specks) == 0) {
+#   cat("Success: No internal data gaps (specks) found within the study area.\n")
+# } else {
+#   cat("Detected", nrow(internal_specks), "pixels with intermittent missing data.\n")
+#   kable(head(internal_specks, 10), caption = "Top 10 pixels with the most frequent internal gaps.")
+#}
+```

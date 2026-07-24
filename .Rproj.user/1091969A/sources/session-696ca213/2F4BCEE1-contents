@@ -1,0 +1,222 @@
+---
+title: "Hydrologic Data Processing Report (1945–2099)"
+subtitle: "Gridded Variables + Station Streamflow"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  eval    = FALSE
+)
+```
+
+# Overview
+
+This report documents the analysis pipeline that combines **two PCIC products** for the Vancouver / Pacific Northwest region:
+
+1. **Gridded hydrologic model output** — multi-variable daily NetCDFs (BASEFLOW, RUNOFF, SWE, EVAP, SOIL_MOIST, plus glacier variables) at 1/16° resolution, 1945–2099.
+2. **Station hydrologic model output** — daily streamflow time series at ~190 hydrometric gauges + dam sites in the Peace, Fraser, and Columbia basins, 1945–2099.
+
+The two are joined to build a covariate-augmented annual block-maximum streamflow table suitable for **GEV (Generalised Extreme Value) modelling** of flood extremes.
+
+> **Correction note.** An earlier version of this report described only the `BASEFLOW` workflow. The corrected version below reflects that the gridded dataset contains *multiple* variables and that the actual analysis uses both gridded covariates and station streamflow.
+
+---
+
+# Data Sources
+
+## Gridded Hydrologic Model Output (multi-variable)
+
+- **Source:** PCIC VIC-GL BCCAQ CMIP5, January 2020 release.
+- **Format:** NetCDF (recommended) — one file per variable per scenario, often split into time chunks.
+- **Resolution:** 0.0625° × 0.0625° (~1/16°, ~6 km).
+- **Coverage:** Peace, Fraser, Columbia basins (originating in British Columbia).
+- **Time:** 1945–2012 (PNWNAmet-driven historical) and 1945–2099 (12 CMIP5 GCM × RCP projections).
+
+### Variables available
+
+PCIC exposes the **standard VIC water-balance outputs** plus VIC-GL glacier additions. The portal variable menu and underlying VIC `OUTVAR` names:
+
+| Portal label | VIC variable | Units | Description |
+|---|---|---|---|
+| Baseflow | `OUT_BASEFLOW` (`BASEFLOW`) | mm/day | Subsurface drainage to streams |
+| Runoff | `OUT_RUNOFF` (`RUNOFF`) | mm/day | Surface runoff |
+| Snow water equivalent | `OUT_SWE` (`SWE`) | mm | Liquid water equivalent of snowpack |
+| Evapotranspiration | `OUT_EVAP` (`EVAP`) | mm/day | Total ET (canopy + transpiration + bare-soil) |
+| Soil moisture | `OUT_SOIL_MOIST` (`SOIL_MOIST`) | mm | Per soil layer (typically 3 layers) |
+| Precipitation | `OUT_PREC` (`PREC`) | mm/day | Forcing precipitation (downscaled BCCAQv2) |
+| Glacier melt / area | VIC-GL glacier outputs | mm/day or fraction | Glacier mass balance contributions |
+
+Each variable file is a 3-D array `(lat, lon, time)`, stored as packed integers with `scale_factor` and `add_offset` (auto-unpacked when downloading NetCDF; values ≤ 0.0009 should be treated as zero).
+
+### Scenarios
+
+- **PNWNAmet** observation-based historical (1945–2012).
+- **12 future projections** = 6 GCMs × RCP 4.5 / RCP 8.5. In this analysis, the **CanESM2** GCM is used (run `r1i1p1`), giving 1 GCM × 2 RCPs.
+
+## Station Hydrologic Model Output (streamflow)
+
+- **Source:** PCIC VIC-GL BCCAQ CMIP5 **RVIC**, February 2020 release.
+- **Format:** one CSV per station; first column `Date`, then `PNWNAmet`, then 12 columns named `<GCM>_<rcp>_<run>` (e.g. `CanESM2_rcp45_r1i1p1`). Units: m³ s⁻¹.
+- **Locations:** ~190 sites (Water Survey of Canada gauges, USGS gauges, dam/project sites).
+- **Note:** flows are **naturalised** at regulated sites.
+- **Time:** 1945–2012 (PNWNAmet) and 1945–2099 (GCM-driven).
+
+---
+
+# Output Products
+
+| Stage | File | Contents |
+|---|---|---|
+| Station merge | `stream_coor_station_3_model.csv` | All stations × all dates × PNWNAmet + CanESM2 rcp45 + CanESM2 rcp85 + coords |
+| Station split | `stream_coor_station_{hist,rcp45,rcp85}.csv` | Same, slimmed to one scenario each |
+| Station blockmax | `sf_yearly_max_{hist,rcp45,rcp85}.csv` | Annual maximum daily streamflow per station |
+| Gridded extract | `daily_bf_{hist,rcp45,rcp85}.tif` | Masked 5×5 neighbourhood baseflow grids (LZW-compressed) |
+| Gridded summary | `avg_daily_bf_{hist,rcp45,rcp85}.parquet` | Per-station per-day **top-9 mean** representative baseflow |
+| Final merge | `year_{hist,rcp45,rcp85}_sf_bf.csv` | GEV input: annual-max streamflow + same-day baseflow covariate |
+
+> The same gridded pipeline can be re-run with a different `variable_name` (`runoff`, `swe`, `evap`, `soil_moist`, etc.) to add other covariates to the GEV table. Only the `variable_name` switch, the input NetCDF paths, and the output filenames need to change.
+
+---
+
+# Spatial Resolution Details
+
+The gridded data uses a **1/16° regular lat-lon grid**: each pixel is 0.0625° in both latitude and longitude.
+
+## Physical dimensions near Vancouver (49.28° N)
+
+- **Latitude (height):** `0.0625° × 111 km ≈ 6.94 km` — constant with latitude.
+- **Longitude (width):** `0.0625° × 111 km × cos(49.28°) ≈ 4.53 km` — shrinks northward.
+- **Pixel area:** ≈ **31.4 km²** in the Vancouver region.
+- **Total pixel count:** **35,041 pixels per layer** across the project domain.
+
+```{r pixel-dimensions, eval=TRUE}
+deg_to_km     <- 111
+resolution    <- 0.0625
+lat_vancouver <- 49.28
+
+lat_height_km  <- resolution * deg_to_km
+lon_width_km   <- resolution * deg_to_km * cos(lat_vancouver * pi / 180)
+pixel_area_km2 <- lat_height_km * lon_width_km
+
+data.frame(
+  Metric = c("Pixel height (km)", "Pixel width (km)", "Pixel area (km²)"),
+  Value  = round(c(lat_height_km, lon_width_km, pixel_area_km2), 2)
+)
+```
+
+## Station neighbourhood (5 × 5 box)
+
+For each station, the gridded extraction uses a 5 × 5 cell box centred on the station's containing grid cell — built via two passes of `terra::adjacent(direction = 8, include = TRUE)`. That is:
+
+- Ring 1 (3 × 3) = 9 cells.
+- Ring 2 (5 × 5) = 25 cells.
+- Approximate ground footprint per station ≈ **25 × 31.4 ≈ 785 km²**.
+
+---
+
+# Processing Strategy
+
+## Stage 1 — Station merge (`merge_station_coord.R`)
+
+Reads all `*.csv.ascii` station files (one per gauge), skips the leading "sequence" comment line, selects `Date`, `PNWNAmet`, `CanESM2_rcp45_r1i1p1`, `CanESM2_rcp85_r1i1p1`, attaches coordinates from `station_coordinate_apr15.xlsx`, and writes the merged + per-scenario CSVs.
+
+## Stage 2 — Station block maxima
+
+Group by `Station × Year` and take `max(streamflow)`. Drop years with fewer than ~350 valid days. Produces `sf_yearly_max_{hist,rcp45,rcp85}.csv`.
+
+## Stage 3 — Gridded variable extraction (multi-variable capable)
+
+For each gridded variable of interest (BASEFLOW, RUNOFF, SWE, EVAP, …):
+
+**Stage 3A — Daily → station-day representative value**
+
+This is the computationally intensive step. For each station × day:
+
+1. Look up the 25 cells in the station's 5 × 5 neighbourhood.
+2. Take the **top 9 cells by value** within that day's slice.
+3. Average them → `Rep_<variable>`.
+
+Processing is done in **5-year temporal chunks** to keep memory under the `memmax = 0.4` ceiling.
+
+**Stage 3B — Monthly / yearly aggregation** (optional, used for the original baseflow report)
+
+- Daily → monthly maximum: 31 layers per chunk → 12 layers per year.
+- Monthly → yearly maximum: 12 layers → 1 per year.
+- Output: 816 monthly layers (68 years × 12 months) and 68 yearly layers for the 1945–2012 PNWNAmet historical run.
+
+## Stage 4 — Merge gridded covariates onto station blockmax
+
+Left-join `sf_yearly_max_{target}.csv` to the per-station daily Parquet on `(Station, MaxDate)`. The covariate value is the *same-day* representative value of the gridded variable on the annual flood day.
+
+Result: `year_{target}_sf_bf.csv` (or analogous filenames for other variables).
+
+---
+
+# Suggested QC Checks
+
+1. **Variable presence.** Verify each NetCDF has the expected variable name (`BASEFLOW`, `RUNOFF`, `SWE`, etc.). Names may be lower-case in some files (`terra::varnames()` confirms).
+2. **Layer counts.**
+   - Monthly stacks: 816 (68 × 12) for the 1945–2012 historical run; 1,860 (155 × 12) for 1945–2099.
+   - Yearly stacks: 68 and 155 respectively.
+3. **Pixel count per layer:** 35,041.
+4. **No-data masking:** ocean / outside-domain cells should remain `NA`, not 0.
+5. **Packed-value rule:** treat unpacked values ≤ 0.0009 as zero.
+6. **Spot-check spatial pattern:** overlay one yearly maximum on a basemap — BASEFLOW should be higher in the wet windward slopes; SWE should peak at high elevations.
+7. **Date alignment:** confirm `time(bf_stack)` covers exactly the expected range after stacking multi-file inputs.
+
+---
+
+# Why Combine Gridded + Station Data?
+
+- **Station streamflow** is the response variable for flood-frequency analysis — directly comparable to observed gauge records and what downstream users care about (return-level estimates).
+- **Gridded variables** provide *physically meaningful covariates* for non-stationary GEV models:
+  - **Baseflow** — antecedent groundwater state on the flood day.
+  - **SWE** — pre-melt snowpack, controlling spring freshet magnitude.
+  - **Soil moisture** — saturation state going into a storm.
+  - **Precipitation** — direct meteorological driver.
+- Using the gridded data lets the GEV location / scale parameters depend on a physical predictor, not just time — improving extrapolation under climate change relative to a stationary fit.
+
+---
+
+# Key References
+
+- Pacific Climate Impacts Consortium, University of Victoria (January 2020). *VIC-GL BCCAQ CMIP5: Gridded Hydrologic Model Output.*
+- Pacific Climate Impacts Consortium, University of Victoria (February 2020). *VIC-GL BCCAQ CMIP5 RVIC: Station Hydrologic Model Output.*
+- Schnorbus, M.A., 2022. *VIC Generation 2 Deployment Report* (Vols. 1–6). <https://hdl.handle.net/1828/21631>
+- Werner, A.T., et al., 2019. PNWNAmet gridded daily meteorological dataset for northwestern North America. *Sci. Data*, 6, 180299.
+- Cannon, A.J., Sobie, S.R., Murdock, T.Q., 2015. Bias Correction of GCM Precipitation by Quantile Mapping. *J. Climate*, 28, 6938–6959.
+- Liang, X., et al., 1994. A simple hydrologically based model of land surface water and energy fluxes for general circulation models. *J. Geophys. Res.*, 99, 14415–14428.
+- Lohmann, D., et al., 1998. Regional scale hydrology: I. Formulation of the VIC-2L model coupled to a routing model. *Hydrol. Sci. J.*, 43, 131–141.
+
+---
+
+# Data Disclaimer
+
+Data are subject to PCIC's terms of use and provided on an "AS IS" basis without warranty as to accuracy or completeness. Reliance is at the user's own risk.
+
+---
+
+# Session Info
+
+```{r session-info, eval=TRUE}
+sessionInfo()
+```

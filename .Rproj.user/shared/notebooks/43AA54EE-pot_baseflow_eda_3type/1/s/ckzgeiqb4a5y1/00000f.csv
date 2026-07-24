@@ -1,0 +1,5 @@
+"0","# Load the percentage maps (Adjust filenames to your saved output)"
+"0","# These should be single-layer rasters representing % of time > threshold"
+"0","pct_hist  <- rast(""pct_exceedance_history.tif"")"
+"2","Error: [rast] file does not exist: pct_exceedance_history.tif
+"

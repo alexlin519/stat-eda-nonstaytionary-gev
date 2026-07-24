@@ -1,0 +1,9 @@
+"0","# Threshold Maps"
+"0","thresh_95_hist  <- rast(""threshold_95_history.tif"")"
+"0","thresh_95_rcp45 <- rast(""threshold_95_rcp45.tif"")"
+"0",""
+"0","# Time Series Data (Replace with your actual file paths)"
+"0","# Assuming these are NetCDF or multi-layer TIFFs"
+"0","ts_hist  <- rast(""baseflow_history_timeseries.nc"")"
+"2","Error: [rast] file does not exist: baseflow_history_timeseries.nc
+"

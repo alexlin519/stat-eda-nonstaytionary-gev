@@ -1,0 +1,26 @@
+
+# Automatically ignored large data files
+stream_coor_station_3_model.csv
+monthly_max_3day_prep_1945_2012.tif
+__archived/Hydrologic Model Output 1945-2099.nc
+daily_bf_rcp45.tif
+daily_raw_pr_history.tif
+.RData
+netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 3.nc
+netCDF_data/Gridded 1945-2012 Baseflow.nc
+netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 2.nc
+netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 1.nc
+terra_temp_scratch/3d_chunk_3.tif
+terra_temp_scratch/3d_chunk_2.tif
+terra_temp_scratch/3d_chunk_5.tif
+terra_temp_scratch/3d_chunk_4.tif
+terra_temp_scratch/7d_chunk_2.tif
+terra_temp_scratch/7d_chunk_3.tif
+terra_temp_scratch/7d_chunk_4.tif
+terra_temp_scratch/7d_chunk_5.tif
+stream_coor_station_hist.csv
+stream_coor_station_rcp45.csv
+stream_coor_station_rcp85.csv
+daily_bf_history.tif
+daily_raw_pr_rcp45.tif
+.RDataTmp2

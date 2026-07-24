@@ -1,0 +1,164 @@
+# =============================================================================
+# inspect_results.R
+# -----------------------------------------------------------------------------
+# Run AFTER spatial_evt_pipeline.R has finished. Prints all the numerical
+# summaries needed to write the report, and saves three supplementary
+# figures into ./figures/.
+#
+# Usage:    source("inspect_results.R")
+# Output:   long printout to stdout  -- copy and paste it back
+#           figures/fig7_xi_hist.png
+#           figures/fig8_std_resid_hist.png
+#           figures/fig9_loocv_error_map.png
+# =============================================================================
+
+options(width = 120, digits = 4, scipen = 4)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+})
+
+out <- readRDS("results/pipeline_output.rds")
+list2env(out, envir = .GlobalEnv)
+
+bar <- function(x) cat("\n", strrep("=", 70), "\n", x, "\n",
+                       strrep("=", 70), "\n", sep = "")
+
+# =============================================================================
+bar("[1]  DATA SUMMARY")
+# =============================================================================
+cat("Stations:                ", nrow(stations), "\n")
+cat("Total station-year rows: ", nrow(flow_hist), "\n")
+cat("Year range:              ", min(flow_hist$year), "to", max(flow_hist$year), "\n")
+cat("Median years per station:", median(table(flow_hist$station_id)), "\n")
+cat("Min/Max years per station:", range(table(flow_hist$station_id)), "\n")
+cat("\nLongitude range:", range(stations$lon), "\n")
+cat("Latitude  range:", range(stations$lat), "\n")
+if (any(!is.na(stations$elev_m))) {
+  cat("Elevation range (m):", range(stations$elev_m, na.rm = TRUE), "\n")
+  cat("Elevation: ", "\n"); print(summary(stations$elev_m))
+} else {
+  cat("Elevation: not available (Stage 2 used baseflow only).\n")
+}
+cat("\nMean baseflow per station:\n");      print(summary(stations$mean_baseflow_hist))
+cat("\nAnnual max flow (all rows):\n");      print(summary(flow_hist$annual_max_flow))
+cat("\nBaseflow at max (all rows):\n");      print(summary(flow_hist$baseflow_at_max))
+
+# =============================================================================
+bar("[2]  STAGE 1  --  PER-STATION GEV")
+# =============================================================================
+ok  <- z20_stage1[z20_stage1$converged, ]
+n_total <- nrow(z20_stage1); n_ok <- nrow(ok)
+cat("Converged: ", n_ok, "/", n_total,
+    sprintf(" (%.1f%%)\n", 100 * n_ok / n_total), sep = "")
+
+cat("\nParameter summaries (converged stations):\n")
+print(summary(ok[, c("mu0", "mu1", "sigma", "xi", "z20", "log_z20")]))
+cat("\nMedian SE of log z_20:", median(ok$se_log_z20), "\n")
+cat("Mean   SE of log z_20:", mean(ok$se_log_z20),   "\n")
+
+# Significance of within-station baseflow effect
+ok$mu1_t <- ok$mu1 / NA   # placeholder; we don't have SE on mu1 directly
+# Quick proxy: rough SE of mu1 from the z_20 SE pattern -- skip if not available
+# Instead, count how many mu1 are positive vs negative
+cat("\nWithin-station baseflow slope mu1:\n")
+cat("  Median:", median(ok$mu1), "\n")
+cat("  IQR:   ", IQR(ok$mu1),    "\n")
+cat("  % positive:", mean(ok$mu1 > 0) * 100, "%\n")
+
+# Distribution of xi (justifies / questions the constant-xi assumption)
+cat("\nShape parameter xi across stations:\n"); print(summary(ok$xi))
+cat("Stations with xi > 0:", sum(ok$xi > 0), "/", n_ok, "\n")
+cat("Stations with xi < 0:", sum(ok$xi < 0), "/", n_ok, "\n")
+
+# =============================================================================
+bar("[3]  STAGE 2  --  REML MATERN KRIGING")
+# =============================================================================
+cat("Trend formula used:", deparse(trend_form), "\n\n")
+print(fit_reml)
+
+cat("\nTrend coefficient estimates (beta in geoR, alpha in report):\n")
+beta_hat <- fit_reml$beta
+beta_var <- fit_reml$beta.var
+beta_se  <- sqrt(diag(beta_var))
+trend_tbl <- data.frame(
+  estimate = unname(beta_hat),
+  std_err  = unname(beta_se),
+  z_stat   = unname(beta_hat / beta_se),
+  p_value  = 2 * pnorm(abs(unname(beta_hat / beta_se)), lower.tail = FALSE)
+)
+rownames(trend_tbl) <- if (length(beta_hat) == 3)
+  c("(Intercept)", "bf_z", "elev_z") else c("(Intercept)", "bf_z")
+print(trend_tbl)
+
+cat("\nMatern covariance components:\n")
+cat("  partial sill (sigma^2): ", fit_reml$sigmasq, "\n")
+cat("  range        (phi, km): ", fit_reml$phi,     "\n")
+cat("  smoothness   (kappa):   ", fit_reml$kappa,   "\n")
+cat("  nugget       (tau^2):   ", fit_reml$nugget,  "\n")
+cat("  practical range (km):   ", fit_reml$practicalRange, "\n")
+cat("  REML log-likelihood:    ", fit_reml$loglik, "\n")
+
+# =============================================================================
+bar("[4]  STAGE 3  --  LOOCV METRICS")
+# =============================================================================
+print(metrics)
+
+cat("\nStandardized residual distribution (should be ~ N(0,1) if calibrated):\n")
+print(summary(loocv$std_resid))
+cat("  mean:    ", mean(loocv$std_resid, na.rm = TRUE), "\n")
+cat("  sd:      ", sd(loocv$std_resid,   na.rm = TRUE), "\n")
+cat("  |r| > 2: ", sum(abs(loocv$std_resid) > 2, na.rm = TRUE),
+    " / ", sum(!is.na(loocv$std_resid)), "\n", sep = "")
+
+cat("\nWorst-predicted stations (top 8 by |LOOCV error|):\n")
+worst <- loocv[order(-abs(loocv$err)), ][1:8, c("station_id", "log_z20_obs",
+                                                "log_z20_pred", "err",
+                                                "std_resid", "cover")]
+print(worst, row.names = FALSE)
+
+# =============================================================================
+bar("[5]  SUPPLEMENTARY FIGURES")
+# =============================================================================
+theme_paper <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold", size = 11))
+
+# fig 7 -- histogram of xi
+p7 <- ggplot(ok, aes(xi)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey40") +
+  geom_vline(xintercept = median(ok$xi), colour = "firebrick", linewidth = 0.8) +
+  labs(title = "Stage 1 — distribution of GEV shape parameter \u03be across stations",
+       x = expression(hat(xi)), y = "Stations") +
+  theme_paper
+ggsave("figures/fig7_xi_hist.png", p7, width = 6, height = 4, dpi = 200)
+
+# fig 8 -- standardized residual histogram with N(0,1) overlay
+p8 <- ggplot(loocv, aes(std_resid)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, fill = "steelblue", colour = "white") +
+  stat_function(fun = dnorm, colour = "firebrick", linewidth = 0.8) +
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = 2, colour = "grey40") +
+  labs(title = "LOOCV — standardized residuals vs N(0,1)",
+       x = "Standardized residual", y = "Density") +
+  theme_paper
+ggsave("figures/fig8_std_resid_hist.png", p8, width = 6, height = 4, dpi = 200)
+
+# fig 9 -- map of LOOCV errors at station locations
+loocv_xy <- merge(loocv, stations[, c("station_id", "x_km", "y_km")],
+                   by = "station_id")
+p9 <- ggplot(loocv_xy, aes(x_km, y_km)) +
+  geom_point(aes(colour = err, size = abs(err))) +
+  scale_colour_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                          midpoint = 0, name = "LOOCV\nerror") +
+  scale_size_continuous(range = c(0.5, 4), name = "|err|", guide = "none") +
+  coord_equal() +
+  labs(title = "LOOCV — spatial pattern of prediction error",
+       x = "Easting (km)", y = "Northing (km)") +
+  theme_paper
+ggsave("figures/fig9_loocv_error_map.png", p9, width = 6.5, height = 4.5, dpi = 200)
+
+cat("\nWrote: figures/fig7_xi_hist.png, fig8_std_resid_hist.png, fig9_loocv_error_map.png\n")
+
+bar("END  --  copy everything above and paste it back to me")

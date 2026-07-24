@@ -1,0 +1,471 @@
+---
+title: "Station Data and Gridded Data Processing"
+subtitle: ""
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  eval    = FALSE   # documentation chunks — flip to TRUE when running locally
+)
+```
+
+# Overview
+
+This document walks through the two-part R pipeline that produces the **GEV modelling input table** from PCIC's gridded and station hydrologic model outputs.
+
+- **Part A — `merge_station_coord.R`** combines the ~190 per-station ASCII streamflow files with a coordinate spreadsheet to produce the merged station tables (`stream_coor_station_3_model.csv`, plus per-scenario splits).
+- **Part B — gridded baseflow extraction** loads the NetCDF baseflow rasters, builds a **5 × 5 grid neighbourhood** around each station, writes a masked GeoTIFF, and produces a **top-9 daily mean** "representative baseflow" parquet table. Finally it merges that baseflow covariate onto the station yearly-maximum streamflow table.
+
+## Pipeline diagram
+
+```
+Station portal CSVs (≈190)         station_coordinate_apr15.xlsx
+       │                                       │
+       └────────────────┬──────────────────────┘
+                        ▼
+            merge_station_coord.R               (Part A)
+                        │
+        ┌───────────────┼───────────────────────────────┐
+        ▼               ▼                               ▼
+stream_coor_      stream_coor_              stream_coor_station_
+station_hist.csv   station_rcp45.csv         rcp85.csv  (+ 3_model.csv)
+        │
+        │ (coords)
+        ▼
+Gridded NetCDF (BASEFLOW)  ──►  Gridded baseflow script        (Part B)
+                                        │
+                  ┌─────────────────────┼───────────────────────────┐
+                  ▼                     ▼                           ▼
+       daily_bf_<target>.tif   avg_daily_bf_<target>.parquet   sf_yearly_max_<target>.csv
+            (Output 1)              (Output 2)                  (already produced upstream)
+                                        │                           │
+                                        └──────── join (Output 3) ──┘
+                                                  │
+                                                  ▼
+                                         year_<target>_sf_bf.csv
+                                         (GEV modelling input)
+```
+
+## Target dataset switch
+
+Both scripts are driven by a single character flag — typically one of:
+
+```r
+target_dataset <- "history"   # or "rcp45", "rcp85"
+```
+
+The downstream filenames (`daily_bf_<target>.tif`, `avg_daily_bf_<target>.parquet`, `year_<target>_sf_bf.csv`) inherit this value, so a single run produces one consistent set of files.
+
+---
+
+# Part A — `merge_station_coord.R`
+
+**Goal.** Read every `*.csv.ascii` station streamflow file, keep only the columns needed (PNWNAmet + the chosen CanESM2 runs), attach station coordinates, and write merged tables.
+
+## A.1 — Load coordinates and list station files
+
+```{r merge-load, eval=FALSE}
+library(tidyverse)
+library(readxl)
+
+# 1. Coordinate file: one row per station with Location Code, Longitude, Latitude
+coords_df       <- read_excel("station_coordinate_apr15.xlsx")
+coords_stations <- coords_df$`Location Code`
+cat("Number of stations in Excel coordinates file:", nrow(coords_df), "\n")
+
+# 2. ASCII station files
+file_list     <- list.files("model_flow", pattern = "\\.csv\\.ascii$", full.names = TRUE)
+file_stations <- str_extract(basename(file_list), "^[^.]+")
+```
+
+## A.2 — Pre-merge diagnostics
+
+Sanity-check that the Excel sheet and the downloaded file set agree before doing any heavy work.
+
+```{r merge-diag, eval=FALSE}
+missing_data   <- setdiff(coords_stations, file_stations)  # in xlsx, no CSV
+missing_coords <- setdiff(file_stations, coords_stations)  # CSV present, no xlsx row
+
+if (length(missing_data) > 0) {
+  cat("WARNING: Stations in Excel but MISSING CSV files:\n"); print(missing_data)
+}
+if (length(missing_coords) > 0) {
+  cat("WARNING: CSV files with no matching coordinate row:\n"); print(missing_coords)
+}
+
+valid_stations <- intersect(file_stations, coords_stations)
+valid_files    <- file_list[file_stations %in% valid_stations]
+```
+
+## A.3 — File inspection (one-off debug)
+
+PCIC's ASCII files start with a "sequence" comment line, so the actual header is on **line 2**. The debug block helps confirm this before batch processing.
+
+```{r merge-debug, eval=FALSE}
+sample_file <- valid_files[1]
+readLines(sample_file, n = 10)                # confirm row-1 is a junk/sequence line
+sample_df <- read_csv(sample_file, show_col_types = FALSE)
+print(colnames(sample_df))
+print(head(sample_df))
+```
+
+## A.4 — Per-station reader
+
+Each station file is reduced to the four useful columns: `Date`, `PNWNAmet` (historical observation-based run), and the two CanESM2 future runs.
+
+```{r merge-fn, eval=FALSE}
+process_station <- function(file_path) {
+  station_name <- str_extract(basename(file_path), "^[^.]+")
+
+  # skip the "sequence" junk line so line 2 becomes the header
+  df <- read_csv(file_path, skip = 1, show_col_types = FALSE)
+
+  df %>%
+    select(Date, PNWNAmet, CanESM2_rcp45_r1i1p1, CanESM2_rcp85_r1i1p1) %>%
+    mutate(
+      Date    = as.Date(Date, format = "%Y/%m/%d"),
+      Station = station_name
+    )
+}
+```
+
+## A.5 — Combine + join coordinates + write
+
+```{r merge-combine, eval=FALSE}
+cat("Processing", length(valid_files), "valid stations...\n")
+all_station_data <- map_dfr(valid_files, process_station)
+
+final_merged_data <- all_station_data %>%
+  inner_join(coords_df, by = c("Station" = "Location Code")) %>%
+  relocate(Station, Longitude, Latitude)
+
+write_csv(final_merged_data, "stream_coor_station_3_model.csv")
+```
+
+## A.6 — Split into per-scenario files
+
+The full merged file is heavy because it carries three streamflow columns. Splitting into three slim files makes the downstream web app / GEV step lighter.
+
+```{r merge-split, eval=FALSE}
+stream_coor_station_3_model <- read_csv("stream_coor_station_3_model.csv")
+
+# Historical (PNWNAmet observation-based)
+stream_coor_station_3_model %>%
+  select(Station, Longitude, Latitude, Date, PNWNAmet) %>%
+  write_csv("stream_coor_station_hist.csv")
+
+# CanESM2 RCP 4.5
+stream_coor_station_3_model %>%
+  select(Station, Longitude, Latitude, Date, CanESM2_rcp45_r1i1p1) %>%
+  write_csv("stream_coor_station_rcp45.csv")
+
+# CanESM2 RCP 8.5
+stream_coor_station_3_model %>%
+  select(Station, Longitude, Latitude, Date, CanESM2_rcp85_r1i1p1) %>%
+  write_csv("stream_coor_station_rcp85.csv")
+```
+
+## A.7 — Date-value mismatch check
+
+Quick QC: on overlapping historical years the PNWNAmet column and the GCM-historical period should *not* be identical (they're different forcings), so a high mismatch count is expected and reassuring.
+
+```{r merge-check, eval=FALSE}
+date_mismatch_hist_rcp45 <- stream_coor_station_3_model %>%
+  filter(PNWNAmet != CanESM2_rcp45_r1i1p1) %>%
+  summarise(count = n())
+
+total_rows <- nrow(stream_coor_station_3_model)
+cat("Mismatched rows hist vs rcp45:", date_mismatch_hist_rcp45$count, "\n")
+cat("Proportion:", date_mismatch_hist_rcp45$count / total_rows, "\n")
+```
+
+---
+
+# Part B — Gridded Baseflow Processing
+
+This is the main script. It produces three outputs per target dataset (`history`, `rcp45`, `rcp85`).
+
+## B.1 — Setup and configuration
+
+```{r grid-setup, eval=FALSE}
+library(terra)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(arrow)
+
+# Memory governance — keep terra from blowing past 40% of RAM
+terraOptions(memmax = 0.4, progress = 10)
+
+# --- SET YOUR TARGET DATASET AND VARIABLE HERE ---
+target_dataset <- "rcp45"    # "history", "rcp45", or "rcp85"
+variable_name  <- "baseflow"
+```
+
+Input NetCDF files:
+
+```{r grid-paths, eval=FALSE}
+file_history <- "netCDF_data/Gridded 1945-2012 Baseflow.nc"
+
+files_rcp45 <- c(
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 1.nc",
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 3.nc",
+  "netCDF_data/CanESM2 RCP45 Baseflow 1945-2099 2.nc"
+)
+
+files_rcp85 <- c(
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 1.nc",
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 3.nc",
+  "netCDF_data/CanESM2 RCP85 Baseflow 1945-2099 2.nc"
+)
+
+target_files <- switch(target_dataset,
+  "history" = file_history,
+  "rcp45"   = files_rcp45,
+  "rcp85"   = files_rcp85,
+  stop("Invalid target_dataset! Use 'history', 'rcp45', or 'rcp85'")
+)
+
+spatial_filename <- paste0("daily_bf_", target_dataset, ".tif")
+tabular_filename <- paste0("avg_daily_bf_", target_dataset, ".parquet")
+```
+
+> **Note on the 3 RCP files.** PCIC ships the long 1945–2099 CanESM2 simulation as multiple NetCDFs; `rast(target_files)` stitches them into a single `SpatRaster` along the time dimension. Verify the date coverage after loading.
+
+## B.2 — Load the raster stack and station coords
+
+```{r grid-load, eval=FALSE}
+coords_df <- read_csv("stream_coor_station_hist.csv")
+
+unique_stations <- coords_df %>%
+  dplyr::select(Station, Longitude, Latitude) %>%
+  distinct()
+
+print(paste("Loading raster data for:", target_dataset))
+bf_stack       <- rast(target_files)[toupper(variable_name)]   # subset to BASEFLOW
+template_layer <- bf_stack[[1]]
+```
+
+## B.3 — Build the 5 × 5 station neighbourhood
+
+For each station, take the grid cell containing it as the **centre**, then expand by two rings of 8-direction adjacency. Ring 1 is the immediate 3 × 3 box (9 cells); ring 2 expands that to 5 × 5 (25 cells). This catches the station's local hydrologic neighbourhood and tolerates small coordinate inaccuracies relative to the 1/16° grid.
+
+```{r grid-neighborhood, eval=FALSE}
+print("Mapping 5x5 grid boundaries to stations...")
+
+station_cells_list <- lapply(1:nrow(unique_stations), function(i) {
+  pt <- vect(unique_stations[i, ],
+             geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+
+  center_cell <- cells(template_layer, pt)[, "cell"]
+  ring_1      <- adjacent(template_layer, center_cell, directions = 8, include = TRUE)
+  ring_2      <- adjacent(template_layer, as.vector(ring_1), directions = 8, include = TRUE)
+
+  data.frame(
+    Station = unique_stations$Station[i],
+    Cell_ID = unique(as.vector(ring_2))
+  )
+})
+
+station_cell_map <- do.call(rbind, station_cells_list)
+keep_cells       <- unique(station_cell_map$Cell_ID)
+```
+
+After this step, `station_cell_map` is a long table of `(Station, Cell_ID)` pairs — up to 25 rows per station.
+
+## B.4 — Output 1: Spatial mask → compressed GeoTIFF
+
+Mask the raster stack to keep only the union of neighbourhood cells, crop to the tight bounding box, and write an LZW-compressed multi-band GeoTIFF (one band per day).
+
+```{r grid-output1, eval=FALSE}
+print(paste("Generating Output 1:", spatial_filename))
+
+mask_rast <- template_layer
+values(mask_rast)   <- NA
+mask_rast[keep_cells] <- 1
+
+grid_ext          <- ext(mask_rast, cells = keep_cells)
+mask_rast_cropped <- crop(mask_rast, grid_ext)
+
+bf_cropped <- crop(bf_stack, grid_ext)
+bf_masked  <- mask(bf_cropped, mask_rast_cropped)
+
+writeRaster(
+  bf_masked, spatial_filename,
+  filetype = "GTiff",
+  gdal     = "COMPRESS=LZW",
+  overwrite = TRUE
+)
+print("Saved Output 1 successfully!")
+
+# Free memory before Output 2
+rm(bf_cropped, bf_masked, mask_rast, mask_rast_cropped); gc()
+```
+
+## B.5 — Output 2: Top-9 daily mean → Parquet
+
+The representative-baseflow logic: for each station × date, take the **top 9 cells** by baseflow within that station's 5 × 5 neighbourhood and average them. This is more robust than a single grid-point pickup and reduces sensitivity to small registration errors, while still emphasising the high-yield cells that drive station inflow.
+
+Processing is **chunked by 5-year groups** to keep memory usage bounded.
+
+```{r grid-output2, eval=FALSE}
+print(paste("Generating Output 2:", tabular_filename))
+
+all_years   <- unique(format(time(bf_stack), "%Y"))
+year_groups <- split(all_years, ceiling(seq_along(all_years) / 5))   # 5-year chunks
+
+chunked_results <- list()
+
+for (i in seq_along(year_groups)) {
+  current_years <- year_groups[[i]]
+  print(paste0("  Chunk ", i, "/", length(year_groups),
+               " (Years: ", min(current_years), "-", max(current_years), ")"))
+
+  sub_stack   <- bf_stack[[format(time(bf_stack), "%Y") %in% current_years]]
+  chunk_dates <- time(sub_stack)
+
+  # Extract values for every (Station, Cell) pair across this chunk's days
+  extracted_mat <- terra::extract(sub_stack, station_cell_map$Cell_ID)
+  extracted_df  <- as.data.frame(extracted_mat)
+  colnames(extracted_df) <- as.character(chunk_dates)
+  extracted_df$Station   <- station_cell_map$Station
+
+  daily_summary <- extracted_df %>%
+    pivot_longer(cols = -Station, names_to = "Date", values_to = "Baseflow") %>%
+    mutate(Date = as.Date(Date)) %>%
+    group_by(Station, Date) %>%
+    slice_max(order_by = Baseflow, n = 9, with_ties = FALSE) %>%
+    summarize(Rep_Baseflow = mean(Baseflow, na.rm = TRUE), .groups = "drop")
+
+  chunked_results[[i]] <- daily_summary
+
+  rm(sub_stack, extracted_mat, extracted_df, daily_summary); gc()
+}
+
+final_tabular_data <- bind_rows(chunked_results)
+write_parquet(final_tabular_data, tabular_filename)
+print("Saved Output 2 successfully!")
+```
+
+**Why Parquet?** Columnar compression handles the (Station × Date) long table well, and reading is much faster than CSV for the join in the next step.
+
+## B.6 — Output 3: Merge baseflow covariate onto streamflow yearly maxima
+
+Pulls the matching `Rep_Baseflow` for each `(Station, MaxDate)` pair from the yearly-maximum streamflow file. This is the table fed into the GEV (Generalised Extreme Value) model.
+
+```{r grid-output3, eval=FALSE}
+library(dplyr); library(readr); library(arrow)
+
+# 1. Streamflow filename matches the target
+sf_filename <- if (target_dataset == "history") {
+  "/Users/alexlin/Downloads/EDA/sf_yearly_max_hist.csv"
+} else {
+  paste0("/Users/alexlin/Downloads/EDA/sf_yearly_max_", target_dataset, ".csv")
+}
+
+# 2. Load
+bf_data     <- read_parquet(tabular_filename)
+sf_max_data <- read_csv(sf_filename)
+
+# 3. Normalise date types
+sf_max_data <- sf_max_data %>% mutate(MaxDate = as.Date(MaxDate))
+bf_data     <- bf_data     %>% mutate(Date    = as.Date(Date))
+
+# 4. Join: streamflow row gets the baseflow value from its annual-max date
+gev_input_data <- sf_max_data %>%
+  left_join(bf_data, by = c("Station" = "Station", "MaxDate" = "Date")) %>%
+  rename(Baseflow_Covariate = Rep_Baseflow)
+
+# 5. QC: how many rows failed to find a covariate?
+missing_covariates <- sum(is.na(gev_input_data$Baseflow_Covariate))
+cat("Rows missing a baseflow covariate after merge:", missing_covariates, "\n")
+
+# 6. Write
+merged_output_filename <- paste0("year_", target_dataset, "_sf_bf.csv")
+write_csv(gev_input_data, merged_output_filename)
+```
+
+The output `year_<target>_sf_bf.csv` is **ready for GEV modelling**: one row per (Station, Year), with annual-max streamflow and the same-day representative baseflow covariate.
+
+## B.7 — Quick data inspection
+
+```{r grid-inspect, eval=FALSE}
+head(gev_input_data)
+tail(gev_input_data)
+
+print("Total NA in Baseflow_Covariate:")
+print(sum(is.na(gev_input_data$Baseflow_Covariate)))
+
+# Sanity: peek at 2013 (first year past PNWNAmet's 2012 cutoff for the history run)
+bf_2013_station_55 <- gev_input_data %>%
+  filter(format(MaxDate, "%Y") == "2013") %>%
+  filter(Station %in% unique_stations$Station)
+
+print("Preview of 2013 data:")
+head(bf_2013_station_55)
+```
+
+---
+
+# Output Files Summary
+
+| File | Source script | Contents | Format |
+|---|---|---|---|
+| `stream_coor_station_3_model.csv` | `merge_station_coord.R` | All stations × all dates × PNWNAmet + 2 CanESM2 runs + coords | CSV |
+| `stream_coor_station_hist.csv` | `merge_station_coord.R` | Slim: PNWNAmet only | CSV |
+| `stream_coor_station_rcp45.csv` | `merge_station_coord.R` | Slim: CanESM2 RCP 4.5 only | CSV |
+| `stream_coor_station_rcp85.csv` | `merge_station_coord.R` | Slim: CanESM2 RCP 8.5 only | CSV |
+| `daily_bf_<target>.tif` | gridded script (Out 1) | Masked 5×5 neighbourhood baseflow, all days, LZW-compressed | GeoTIFF |
+| `avg_daily_bf_<target>.parquet` | gridded script (Out 2) | Per-station per-day **top-9 mean** baseflow | Parquet |
+| `year_<target>_sf_bf.csv` | gridded script (Out 3) | GEV input: annual-max streamflow + same-day baseflow covariate | CSV |
+
+---
+
+# Key Design Decisions
+
+1. **Single GCM, single run.** Only **CanESM2 r1i1p1** is retained from the 12 PCIC scenarios. This keeps the pipeline lean; trade-off is loss of inter-model uncertainty.
+2. **5 × 5 neighbourhood.** Two rings of 8-direction adjacency = 25 cells. Provides spatial robustness against geolocation error; the neighbourhood covers ≈ 31 km × 5 ≈ 155 km² around each station in the Vancouver region.
+3. **Top-9 mean as "representative baseflow".** Captures the dominant runoff-producing cells in the neighbourhood (~36 % of the 25 cells, the upper third) rather than a single nearest-grid pick or the full neighbourhood mean.
+4. **5-year temporal chunks.** Memory ceiling of `memmax = 0.4` (40 % of system RAM) makes 5-year groups a safe extraction size for the full 1945–2099 horizon.
+5. **Parquet for the daily table.** The (≈190 stations × 56,000 days ≈ 10.6 M rows) intermediate is much smaller and faster as Parquet than as CSV.
+6. **`MaxDate` join.** The baseflow covariate is sampled on the *day of the annual streamflow maximum* — i.e. the antecedent / coincident baseflow on the flood day, rather than annual mean baseflow.
+
+---
+
+# Run Order
+
+```r
+# Run once for each target_dataset value:
+target_dataset <- "history"  ;  source("baseflow_gridded.R")
+target_dataset <- "rcp45"    ;  source("baseflow_gridded.R")
+target_dataset <- "rcp85"    ;  source("baseflow_gridded.R")
+```
+
+Each pass produces one `.tif`, one `.parquet`, and one `year_<target>_sf_bf.csv`. Concatenating the three `year_*_sf_bf.csv` files gives the full GEV training table (with a `target` column to distinguish them).
+
+---
+
+# Session Info
+
+```{r session-info, eval=TRUE}
+sessionInfo()
+```

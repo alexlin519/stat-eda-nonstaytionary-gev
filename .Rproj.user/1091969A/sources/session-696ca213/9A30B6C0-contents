@@ -1,0 +1,59 @@
+# 1. Install required packages if you don't have them
+# install.packages("leaflet")
+# install.packages("raster")
+
+# 2. Load the libraries
+library(leaflet)
+library(raster)
+
+# ==========================================
+# STEP 1: READ THE TIF DATA
+# ==========================================
+
+# Replace "your_map.tif" with the actual path to your file
+# Make sure to use forward slashes (/) in your file path
+my_raster <- raster("threshold_90_history.tif")
+
+# ==========================================
+# STEP 2: DEFINE A COLOR PALETTE (Optional)
+# ==========================================
+
+# Leaflet needs to know how to color the different values in your TIF.
+# Here we create a palette. You can change the colors to whatever you prefer.
+# Example colors: Blue to Yellow to Red
+my_palette <- colorNumeric(
+  palette = c("blue", "yellow", "red"), 
+  domain = values(my_raster),
+  na.color = "transparent" # Makes missing data invisible instead of an ugly grey block
+)
+
+# ==========================================
+# STEP 3: CREATE THE INTERACTIVE MAP
+# ==========================================
+
+interactive_map <- leaflet() %>%
+  
+  # Add the default OpenStreetMap base layer
+  addTiles() %>% 
+  
+  # Add the TIF image layer
+  addRasterImage(
+    x = my_raster, 
+    colors = my_palette, # Uses the palette we defined above
+    opacity = 0.7,       # 0.7 makes it slightly see-through so you can read the base map underneath
+    project = TRUE       # CRITICAL: This automatically converts your TIF's projection to match Leaflet's web map
+  ) %>%
+  
+  # Optional: Add a legend so users know what the colors mean
+  addLegend(
+    pal = my_palette, 
+    values = values(my_raster),
+    title = "Raster Values",
+    position = "bottomright"
+  )
+
+# ==========================================
+# STEP 4: DISPLAY THE MAP
+# ==========================================
+
+interactive_map

@@ -1,0 +1,269 @@
+---
+title: "Baseflow Data Processing Report (1945-2012)"
+subtitle: "PCIC VIC-GL Gridded Hydrologic Model Output — Temporal Aggregation and Spatial Resolution Analysis"
+author: "Pacific Northwest / Vancouver Region Analysis"
+date: "2026-03-04"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Overview
+
+This report documents the analysis of **gridded baseflow data from 1945 to 2012** for the Vancouver / Pacific Northwest region. The workflow calculates monthly and yearly maximum baseflow values from daily NetCDF data using an optimized incremental processing approach.
+
+The underlying dataset is the **PCIC VIC-GL BCCAQ CMIP5 Gridded Hydrologic Model Output**, produced by the Pacific Climate Impacts Consortium (PCIC) at the University of Victoria. Context for the broader PCIC hydrologic data ecosystem (both the gridded product used here and the companion station-streamflow product) is included below for reference.
+
+## Data Characteristics
+
+| Attribute | Value |
+|---|---|
+| Variable | `BASEFLOW` (mm/day) |
+| Temporal Coverage | 1945–2012 (68 years) |
+| Spatial Resolution | 0.0625° × 0.0625° (1/16 degree grid) |
+| Coordinate System | WGS 84 (EPSG:4326) |
+| Region | Vancouver / Pacific Northwest |
+| Source | PCIC VIC-GL BCCAQ CMIP5 (gridded) |
+
+## Output Products
+
+- **Monthly maximum baseflow:** 816 layers (68 years × 12 months)
+- **Yearly maximum baseflow:** 68 layers (one per year)
+
+---
+
+# Data Source: PCIC Hydrologic Model Outputs
+
+PCIC publishes two related hydrologic products built from the same modelling framework. This analysis uses the **Gridded** product; the **Station (streamflow)** product is summarised here for completeness because both datasets share the same model engine and forcing setup.
+
+## Shared Modelling Background
+
+Both datasets are produced using:
+
+- **Hydrologic model:** Variable Infiltration Capacity model, reconfigured to couple with an external dynamic glacier model (**VIC-GL**).
+- **Forcing (future):** 6 statistically downscaled CMIP5 GCMs × 2 RCP scenarios (RCP 4.5 and RCP 8.5) = **12 future projections**.
+- **Downscaling:** Bias Correction / Constructed Analogues + Quantile mapping (**BCCAQv2**).
+- **Target meteorology:** PCIC's **PNWNAmet** gridded dataset for northwestern North America.
+- **Watersheds covered:** **Peace**, **Fraser**, and **Columbia** basins.
+
+## Gridded Hydrologic Model Output (used in this analysis)
+
+This data portal provides gridded projections of hydrologic states and fluxes for three watersheds that originate in British Columbia (Peace, Fraser, Columbia).
+
+**Features**
+
+- Historical and future periods at a resolution of approximately 30 km² (1/16°, ~6 km).
+- Variables include **runoff, baseflow, snow, evaporation, and soil moisture**.
+- Choice between moderate (RCP 4.5) and high (RCP 8.5) emissions scenarios.
+- Interactive map (zoom, pan, select region of interest).
+- Download in **NetCDF** (recommended) or ASCII format.
+- Portal: <https://data.pacificclimate.org/portal/hydro_model_out/map/>
+
+**Usage notes**
+
+- Each variable is stored as a 3-D array `(lat, lon, time)`.
+- Values are stored **packed** on the server. NetCDF downloads are unpacked automatically; ASCII downloads must be unpacked manually using the metadata `scale_factor` and `add_offset`.
+- Some precision is lost during unpacking — values ≤ 0.0009 should be treated as zero.
+- To evaluate climate change, always compare future vs. past **within the same GCM–RCP combination**.
+
+**Citation**
+
+> Pacific Climate Impacts Consortium, University of Victoria, (January 2020). *VIC-GL BCCAQ CMIP5: Gridded Hydrologic Model Output*. Downloaded from `<Permalink>` on `<Date>`.
+
+## Station Hydrologic Model Output (companion dataset)
+
+This portal provides **simulated daily streamflow** at approximately **190 locations** in the Peace, Fraser, and Columbia basins.
+
+**Features**
+
+- Time period: **1945–2099** (GCM-driven) plus an **observation-based simulation 1945–2012** using PNWNAmet.
+- Same 12 CMIP5 × RCP projections as the gridded dataset.
+- Stations correspond to Water Survey of Canada gauges, USGS gauges, and dam/project sites.
+- Flows are **naturalized** at regulated sites (no reservoir operation).
+- Routing: **RVIC** streamflow routing model.
+- Download in **ASCII / CSV** (one file per station).
+- Portal: <https://services.pacificclimate.org/portal/hydro_stn_cmip5/map/>
+
+**File format**
+
+Each station CSV contains: `date`, then the PNWNAmet observation-based run, then one column per CMIP5 scenario (e.g. `ACCESS1-0_rcp85_r1i1p1`). Streamflow units: **m³ s⁻¹**.
+
+**Citation**
+
+> Pacific Climate Impacts Consortium, University of Victoria, (February 2020). *VIC-GL BCCAQ CMIP5 RVIC: Station Hydrologic Model Output*. Downloaded from `<Permalink>` on `<Date>`.
+
+## Quick Comparison
+
+| Aspect | Gridded *(this analysis)* | Station (Streamflow) |
+|---|---|---|
+| Output type | Spatial grids of hydrologic states/fluxes | Time series at point locations |
+| Resolution / locations | 1/16° (~6 km) | ~190 stations |
+| Variables | Runoff, baseflow, snow, evaporation, soil moisture | Daily streamflow (m³/s), naturalized |
+| Time period | 1945–2099 | 1945–2099 (+ 1945–2012 obs-based) |
+| Routing | Not routed | RVIC routing |
+| Formats | NetCDF (recommended), ASCII | ASCII / CSV |
+
+---
+
+# Spatial Resolution Details
+
+The data is recorded on a **1/16 degree grid**, where each pixel is exactly **0.0625°** in both latitude and longitude.
+
+## Physical dimensions near Vancouver (49.28° N)
+
+- **Latitude (height):** `0.0625° × 111 km ≈ 6.94 km`
+  - This dimension remains constant regardless of latitude.
+- **Longitude (width):** `0.0625° × 111 km × cos(49.28°) ≈ 4.53 km`
+  - This dimension decreases as you move northward due to meridian convergence.
+- **Pixel area:** approximately **31.4 km²** per pixel in the Vancouver region.
+- **Total pixel count:** **35,041 pixels per layer** (calculated from the spatial extent and resolution).
+
+```{r pixel-dimensions}
+# Quick verification of the pixel geometry
+deg_to_km    <- 111
+resolution   <- 0.0625
+lat_vancouver <- 49.28
+
+lat_height_km <- resolution * deg_to_km
+lon_width_km  <- resolution * deg_to_km * cos(lat_vancouver * pi / 180)
+pixel_area_km2 <- lat_height_km * lon_width_km
+
+data.frame(
+  Metric = c("Pixel height (km)", "Pixel width (km)", "Pixel area (km²)"),
+  Value  = round(c(lat_height_km, lon_width_km, pixel_area_km2), 2)
+)
+```
+
+---
+
+# Processing Strategy
+
+The analysis employs a **two-stage aggregation strategy** to optimize memory usage and computational efficiency. Data is processed in **decade-long chunks (10-year groups)** to manage memory constraints.
+
+## Stage A: Daily → Monthly Maximum
+
+This is the **computationally intensive step**, processing up to 31 daily layers per month.
+
+```{r stage-a, eval=FALSE}
+library(terra)
+library(lubridate)
+
+# Pseudocode for Stage A
+# For each decade chunk:
+#   1. Open daily NetCDF as SpatRaster
+#   2. Extract time index
+#   3. Group layers by year-month
+#   4. Compute pixel-wise max across each month
+#   5. Write monthly max raster stack to disk
+
+daily_to_monthly_max <- function(daily_nc, out_path) {
+  r       <- terra::rast(daily_nc)
+  dates   <- terra::time(r)
+  ym      <- format(dates, "%Y-%m")
+  monthly <- terra::tapp(r, index = ym, fun = "max", na.rm = TRUE)
+  terra::writeRaster(monthly, out_path, overwrite = TRUE)
+  monthly
+}
+```
+
+## Stage B: Monthly → Yearly Maximum
+
+This step is **extremely fast** because it only processes 12 monthly layers per year instead of 365 daily layers.
+
+```{r stage-b, eval=FALSE}
+monthly_to_yearly_max <- function(monthly_rast, out_path) {
+  yr     <- substr(names(monthly_rast), 1, 4)   # or use terra::time()
+  yearly <- terra::tapp(monthly_rast, index = yr, fun = "max", na.rm = TRUE)
+  terra::writeRaster(yearly, out_path, overwrite = TRUE)
+  yearly
+}
+```
+
+## Decade Chunking
+
+```{r decades, eval=FALSE}
+decades <- list(
+  c(1945, 1954),
+  c(1955, 1964),
+  c(1965, 1974),
+  c(1975, 1984),
+  c(1985, 1994),
+  c(1995, 2004),
+  c(2005, 2012)   # final chunk is 8 years
+)
+
+for (d in decades) {
+  message("Processing decade: ", d[1], "–", d[2])
+  # 1. Subset NetCDF to decade range
+  # 2. Run Stage A (daily -> monthly max)
+  # 3. Append result to a master monthly stack
+}
+
+# After all decades:
+# 4. Run Stage B on the master monthly stack
+```
+
+---
+
+# Suggested Quality-Control Checks
+
+Before publishing the monthly and yearly maximum rasters:
+
+1. **Layer counts**
+   - Monthly stack should contain exactly **816 layers** (68 × 12).
+   - Yearly stack should contain exactly **68 layers**.
+2. **Pixel count per layer** = **35,041**.
+3. **No-data masking** — ocean / outside-domain cells should remain `NA`, not 0.
+4. **Sanity range** — `BASEFLOW` values should be non-negative; remember the ≤ 0.0009 → 0 rule from the source data unpacking.
+5. **Spot-checks** — overlay one yearly maximum layer on a basemap of the Fraser/Columbia headwaters and confirm the spatial pattern is physically plausible (higher baseflow on the wet windward slopes).
+
+---
+
+# Key References
+
+- **Schnorbus, M.A., 2022.** *VIC Generation 2 Deployment Report* (Volumes 1–6). <https://hdl.handle.net/1828/21631>
+- **Werner, A.T., et al., 2019.** A long-term, temporally consistent, gridded daily meteorological dataset for northwestern North America (PNWNAmet). *Sci. Data*, 6, 180299. <https://doi.org/10.1038/sdata.2018.299>
+- **Cannon, A.J., Sobie, S.R., Murdock, T.Q., 2015.** Bias Correction of GCM Precipitation by Quantile Mapping. *Journal of Climate*, 28, 6938–6959. <https://doi.org/10.1175/JCLI-D-14-00754.1>
+- **Werner, A.T. and Cannon, A.J., 2016.** Hydrologic extremes — an intercomparison of multiple gridded statistical downscaling methods. *Hydrol. Earth Syst. Sci.*, 20, 1483–1508. <https://doi.org/10.5194/hess-20-1483-2016>
+- **Liang, X., et al., 1994.** A simple hydrologically based model of land surface water and energy fluxes for general circulation models. *J. Geophys. Res. Atmospheres*, 99, 14415–14428. <https://doi.org/10.1029/94JD00483>
+- **Taylor, K.E., Stouffer, R.J., Meehl, G.A., 2011.** An Overview of CMIP5 and the Experiment Design. *Bull. Am. Meteorol. Soc.*, 93, 485–498. <https://doi.org/10.1175/BAMS-D-11-00094.1>
+- **van Vuuren, D.P., et al., 2011.** The representative concentration pathways: an overview. *Clim. Change*, 109, 5. <https://doi.org/10.1007/s10584-011-0148-z>
+
+---
+
+# Data Disclaimer
+
+This data is subject to PCIC's terms of use. It has been obtained from a variety of sources and is provided as a public service by the Pacific Climate Impacts Consortium. The data is provided by the Consortium on an "AS IS" basis without any warranty or representation, express or implied, as to its accuracy or completeness. Any reliance you place upon the information is your sole responsibility and at your own risk.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

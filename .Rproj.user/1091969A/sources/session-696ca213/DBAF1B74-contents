@@ -1,0 +1,170 @@
+
+---
+title: "GEV Station Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Chunk options to keep the final report clean from warnings and messages
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Load Required Libraries
+library(dplyr)
+library(ggplot2)
+library(ismev)
+library(extRemes) # Required for fevd()
+library(knitr)    # Required for formatting tables nicely (kable)
+library(gridExtra) # Required for grid.arrange()
+
+# ==============================================================================
+# LOAD YOUR DATA HERE
+# ==============================================================================
+sf_hist <- read.csv("sf_yearly_max_hist.csv")
+target_stations <- unique(sf_hist$Station)[1:16]
+```
+
+## Global Parameter Confidence Intervals
+
+```{r global_ci_plots, fig.height=8, fig.width=8}
+# ==============================================================================
+# 1. BUILD MASTER SUMMARY DATAFRAME
+# ==============================================================================
+# We need to extract the CIs for all stations first so your plot code works.
+master_summary <- data.frame()
+
+for (stn in target_stations) {
+  stn_data <- sf_hist %>% 
+    filter(Station == stn & Year > 1945 & Year <= 2012) %>% 
+    na.omit()
+  
+  if (nrow(stn_data) > 0) {
+    fit <- gev.fit(stn_data$MaxFlow, show = FALSE)
+    est <- fit$mle
+    se  <- fit$se
+    
+    # Calculate 95% CI (Estimate +/- 1.96 * Standard Error)
+    temp_df <- data.frame(
+      Station = stn,
+      Stat_Mu_Est    = est[1], 
+      Stat_Mu_Lower  = est[1] - 1.96 * se[1], 
+      Stat_Mu_Upper  = est[1] + 1.96 * se[1],
+      
+      Stat_Sigma_Est = est[2], 
+      Stat_Sig_Lower = est[2] - 1.96 * se[2], 
+      Stat_Sig_Upper = est[2] + 1.96 * se[2],
+      
+      Stat_Xi_Est    = est[3], 
+      Stat_Xi_Lower  = est[3] - 1.96 * se[3], 
+      Stat_Xi_Upper  = est[3] + 1.96 * se[3]
+    )
+    master_summary <- rbind(master_summary, temp_df)
+  }
+}
+
+# ==============================================================================
+# 2. RENDER THE PLOTS (Your Code)
+# ==============================================================================
+p_mu <- ggplot(master_summary, aes(x = reorder(Station, Stat_Mu_Est), y = Stat_Mu_Est)) +
+  geom_point(color = "darkblue") +
+  geom_errorbar(aes(ymin = Stat_Mu_Lower, ymax = Stat_Mu_Upper), width = 0.2) +
+  coord_flip() + 
+  labs(title = expression(paste("Location Parameter (", mu, ") with 95% CI")),
+       x = "Station", y = "Estimate") +
+  theme_minimal()
+
+p_sig <- ggplot(master_summary, aes(x = reorder(Station, Stat_Sigma_Est), y = Stat_Sigma_Est)) +
+  geom_point(color = "darkgreen") +
+  geom_errorbar(aes(ymin = Stat_Sig_Lower, ymax = Stat_Sig_Upper), width = 0.2) +
+  coord_flip() + 
+  labs(title = expression(paste("Scale Parameter (", sigma, ") with 95% CI")),
+       x = "Station", y = "Estimate") +
+  theme_minimal()
+
+p_xi <- ggplot(master_summary, aes(x = reorder(Station, Stat_Xi_Est), y = Stat_Xi_Est)) +
+  geom_point(color = "darkred") +
+  geom_errorbar(aes(ymin = Stat_Xi_Lower, ymax = Stat_Xi_Upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  coord_flip() + 
+  labs(title = expression(paste("Shape Parameter (", xi, ") with 95% CI")),
+       x = "Station", y = "Estimate") +
+  theme_minimal()
+
+grid.arrange(p_mu, p_sig, p_xi, ncol = 1)
+```
+
+<hr>
+
+## Individual Station Analysis
+
+```{r define_function}
+# ==============================================================================
+# CORE ANALYSIS FUNCTION
+# ==============================================================================
+run_gev_analysis <- function(station_name, data, stn_index) {
+  
+  stn_data <- data %>% filter(Station == station_name)
+  stn_data <- stn_data %>% filter(Year > 1945 & Year <= 2012)
+  stn_data <- na.omit(stn_data)
+  
+  # ALWAYS VISIBLE: RETURN LEVEL PLOT 
+  par(mfrow = c(1, 1)) 
+  fit_ext <- fevd(stn_data$MaxFlow, type = "GEV")
+  fit_ext$call <- NULL 
+  plot(fit_ext, type = "rl", main = paste("Return Level Plot:", station_name))
+  
+  # START HTML TOGGLE
+  cat(paste0("\n\n<details><summary><span style='font-size:1.2em; font-weight:bold; cursor:pointer; color:#2c3e50;'>&#9654; Expand Diagnostics & Details for Station ", stn_index, "</span></summary>\n\n"))
+  
+  # HIDDEN 1: TIME SERIES PLOT
+  ts_plot <- ggplot(stn_data, aes(x = Year, y = MaxFlow)) +
+    geom_line(color = "steelblue", linewidth = 1) +
+    geom_point(color = "darkblue", size = 2) +
+    labs(title = paste("Station:", station_name, "- Annual Max Flow (1946-2012)"),
+         x = "Year", y = "Max Flow") +
+    theme_minimal()
+  
+  print(ts_plot)
+  cat("\n\n") 
+  
+  # HIDDEN 2: FIT GEV & DIAGNOSTIC PLOTS
+  fit_stat <- gev.fit(stn_data$MaxFlow, show = FALSE)
+  
+  par(oma = c(0, 0, 3, 0)) 
+  gev.diag(fit_stat)
+  mtext(paste("Station:", station_name, "- GEV Diagnostic Plots"), 
+        outer = TRUE, cex = 1.5, font = 2)
+  par(oma = c(0, 0, 0, 0))
+  cat("\n\n") 
+  
+  # HIDDEN 3: SUMMARY TABLE 
+  est <- fit_stat$mle
+  se  <- fit_stat$se
+  corr_matrix <- cov2cor(fit_stat$cov)
+  
+  summary_table <- data.frame(
+    Parameter = c("Location (mu)", "Scale (sigma)", "Shape (xi)"),
+    Estimate  = round(est, 4),
+    Std_Error = round(se, 4),
+    Corr_mu   = round(corr_matrix[, 1], 4),
+    Corr_sig  = round(corr_matrix[, 2], 4),
+    Corr_xi   = round(corr_matrix[, 3], 4)
+  )
+  
+  cat("<h4>Parameter Estimates, Standard Errors, and Correlation Matrix</h4>\n")
+  cat(paste(knitr::kable(summary_table, format = "html", table.attr = "class='table table-striped'"), collapse = "\n"))
+  
+  # END HTML TOGGLE
+  cat("\n\n</details>\n<hr>\n\n")
+  
+  invisible(fit_stat)
+}
+```
+
+```{r loop_stations, results='asis', fig.height=6, fig.width=8}
+# Loop through the target stations
+for (i in seq_along(target_stations)) {
+  run_gev_analysis(target_stations[i], sf_hist, i)
+}
+```
+
+```
