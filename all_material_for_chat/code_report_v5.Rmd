@@ -1,0 +1,1730 @@
+---
+title: "Non-stationary conditional extremes for BC streamflow: the code report (v5, consolidated)"
+author: "Alex Lin (supervisor: Natalia Nolde)"
+date: "August 18, 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+params:
+  start_year: 1969     # meeting 62: all of 1968 is discarded before anything runs
+  spacing_yr: 5        # trend-spline knot spacing (v8 Sec 4.2, p. 7)
+  doy_k: 12            # cyclic day-of-year basis size (threshold); 8 at the GP stage
+  tau_star: 0.95       # working threshold level (v8 Sec 2.1, p. 3)
+  kappa: 0.95          # dependence threshold level on the Laplace scale (v8 Sec 3, p. 3)
+  cond_level: 0.99     # conditioning level for the three functionals (v8 Sec 6, eq. 14, p. 16)
+  band_lo: 0.95        # P_band lower bound: the day's marginal quantile level
+  band_hi: 0.995       # P_band upper bound
+  B_boot: 25           # knit-scale bootstrap; paper scale is 2000 with selections inside
+  n_mc: 10000          # Monte Carlo generation size (v8 Sec 6, p. 16)
+  refit_ladders: false # false = reuse cache_ladder_*.rds; true = force refit
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9.5, fig.height = 5.5, dpi = 110)
+set.seed(20260818)
+library(quantreg)
+library(splines)
+
+## software routes: packages are production where installed; the project
+## fitters are the fallback and, where both run, the consistency check.
+## qgam is the threshold production route (decision of Aug 18, on the
+## qgam papers); evgam the GP route; texmex/mgcv the dependence checks.
+has <- c(qgam     = requireNamespace("qgam",     quietly = TRUE),
+         evgam    = requireNamespace("evgam",    quietly = TRUE),
+         extRemes = requireNamespace("extRemes", quietly = TRUE),
+         texmex   = requireNamespace("texmex",   quietly = TRUE),
+         mgcv     = requireNamespace("mgcv",     quietly = TRUE))
+if (has["qgam"]) library(qgam)   # qgam's formulas resolve on the search path
+```
+
+This report is the working pipeline for the paper *Non-stationary modelling
+of stream flow extremes under climate change scenarios*: one pair first ---
+Case 4, BRIDG given NTHMB, with Case 1 (BARRM given BARRS) as the
+asymptotic-dependence anchor (v8 \S1, p. 2; \S5, p. 12). Every reference of
+the form "v8 \S$x$, eq. ($n$), p. $y$" points into *my current understanding
+of the model*, version 8. Four design facts orient everything below.
+
+**The working scale is Laplace** (v8 \S3, eq. 6, p. 4; Keef et al. 2013, eq.
+2.1): both tails exactly exponential, so one parametric form covers positive
+and negative association with $a \in [-1,1]$ (v8 \S5, eq. 8, p. 11), and the
+Keef parameter constraints police extrapolation (v8 \S5, eq. 9, p. 13).
+
+**The margins carry the seasonal cycle alongside the trend.** The marginal
+diagnostic of v8 \S3 (p. 4) failed in review --- the PIT showed a clear
+seasonal shape --- so the repair v8 \S4.2 (p. 7) names is adopted: the
+single-$t$ basis is swapped for one that contains a shared periodic
+day-of-year cycle next to the trend spline, coefficients, penalty and
+fitting unchanged. The threshold now moves with the seasons within each
+year, and "roughly 5\% above the threshold" becomes checkable *locally* ---
+per season and per decade --- not just pooled. One consequence is flagged
+for discussion: with a seasonal threshold, "extreme" means extreme relative
+to the season, so a winter exceedance is a modest absolute flow; the annual
+return level (v8 \S6, eq. 12, p. 14) is unaffected, but the reading of the
+dependence-stage conditioning event changes and should be agreed explicitly.
+
+**Data are cleaned before anything is fitted.** All of 1968 is discarded;
+the forensics section hunts the repeated values, the low-flow floor and the
+winter quality problems, and reports evidence --- which days, which values,
+which months --- so the exclusion decisions can be made deliberately and
+documented in the paper. No exclusion beyond 1968 is applied silently.
+
+**Packages are production where they exist** (v8 \S4.5, p. 9): qgam for the
+threshold ladder (automatic smoothing; its three recorded costs --- no
+non-crossing constraint, iid calibration theory, care at extreme rungs ---
+are v8 \S4.4, p. 9, and each is handled below), evgam for the GP tail,
+extRemes for the extremal index, texmex and mgcv as the dependence checks.
+The dependence fitter itself is project code: no package fits the
+non-stationary Heffernan--Tawn model. The routes table states the intent;
+each stage table below reports the route actually used after any fallback.
+
+```{r routes}
+route <- data.frame(
+  stage = c("threshold ladder", "GP tail", "extremal index",
+            "dependence fitter", "dependence checks"),
+  production = c(
+    ifelse(has["qgam"], "qgam/mqgam (seasonal + trend)", "project pen_rq (fallback)"),
+    ifelse(has["evgam"], "evgam (gpd, seasonal + trend)", "project fit_gp (fallback)"),
+    ifelse(has["extRemes"], "extRemes::extremalindex", "project ferro_segers (fallback)"),
+    "project ht fitter with Keef constraints (no package exists)",
+    paste0("tier 1 texmex: ", ifelse(has["texmex"], "on", "off"),
+           " | tier 2 mgcv: ", ifelse(has["mgcv"], "on", "off"))))
+knitr::kable(route, caption = "Software routes this knit -- the INTENT. The
+stage tables below each report the route actually used after any tryCatch
+fallback; trust those, not this one.")
+```
+
+# Data, axis, integrity gates
+
+The file is the definitive RCP 4.5 export; the axis is its extent *after*
+the 1968 drop (v8 \S1, p. 1: RCP 4.5 alone; meeting 62: discard 1968).
+
+```{r data}
+raw <- read.csv("daily_sf_bf_rcp45_only_1945_2099_9avg.csv",
+                colClasses = c("character", "character", "numeric", "numeric"))
+names(raw) <- c("station", "date", "sf", "bf")
+raw$date <- as.Date(raw$date)
+raw$year <- as.integer(format(raw$date, "%Y"))
+
+## integrity gates on the RAW file, before the 1968 drop
+dup_rows <- sum(duplicated(raw[, c("station", "date")]))
+cat("duplicated (station, date) rows in the file:", dup_rows, "\n")
+full_seq <- seq(min(raw$date), max(raw$date), by = "day")
+miss <- sapply(split(raw$date, raw$station),
+               function(d) length(setdiff(full_seq, d)))
+cat("missing dates per station (0 everywhere = continuous):",
+    paste(range(miss), collapse = "-"), "\n")
+cat("NA counts: sf", sum(is.na(raw$sf)), "| bf", sum(is.na(raw$bf)), "\n")
+cat("bf <= 0 days, worst stations:\n")
+bfneg <- sort(tapply(raw$bf <= 0, raw$station, sum), decreasing = TRUE)
+print(head(bfneg[bfneg > 0], 5))
+
+keep1968 <- raw[raw$year < params$start_year, ]   # kept aside for forensics
+d68 <- keep1968
+raw <- raw[raw$year >= params$start_year, ]
+
+a0 <- min(raw$date); a1 <- max(raw$date)
+dates <- sort(unique(raw$date)); N <- length(dates)
+years <- as.integer(format(dates, "%Y"))
+months <- as.integer(format(dates, "%m"))
+doy <- as.integer(format(dates, "%j"))
+tt <- as.numeric(dates - a0) / as.numeric(a1 - a0)
+span_yr <- as.numeric(a1 - a0) / 365.25
+
+get_series <- function(st, var, df = raw) {
+  d <- df[df$station == st, ]; d[[var]][order(d$date)]
+}
+C_st <- "NTHMB"; X_st <- "BRIDG"          # Case 4: X | C (v8 Sec 1, p. 2)
+A_C <- "BARRS"; A_X <- "BARRM"            # Case 1 anchor (v8 Sec 5, p. 12)
+xC <- get_series(C_st, "sf"); xX <- get_series(X_st, "sf")
+xB <- get_series(X_st, "bf")              # Structure-B conditioning variable
+
+stopifnot(length(xC) == N, length(xX) == N, !anyNA(c(xC, xX, xB)),
+          all(xC > 0), all(xX > 0))
+cat("Axis after cleaning gate:", format(a0), "to", format(a1), "-", N,
+    "days,", round(span_yr, 1), "years\n")
+```
+
+# Data forensics (meeting 62, the first problem)
+
+Three artifacts motivated this section, seen on the previous knit's figures:
+a flat run in the pooled QQ plots ending in a jump near sample value $-2.4$,
+and two straight line segments hugging the axes of the joint pseudosample
+panel. Three candidate causes, in decreasing order of code-vs-data:
+
+(i) *a transform artifact*: the old transform clamped every day whose
+fitted probability fell below $10^{-5}$ to that single number, and
+$-\log(-\log 10^{-5}) = -2.44$ on the Gumbel scale --- exactly the observed
+floor. All days far enough below the bottom ladder rung collapsed onto one
+point, which draws a flat QQ run ending in a jump, and straight lines in
+any joint scatter. Section 5's rebuilt transform removes the clamp; its
+instrumentation counts the affected days so the artifact is quantified, not
+just repaired.
+
+(ii) *repeated identical values in the data*: ties --- from winter freezing
+floors, detection limits, or values entered more than once --- put genuine
+point masses in the sample. Ties survive any honest transform (they are
+data, not code), and this section finds them: which values, which months,
+which years.
+
+(iii) *the trend-only margins*: a threshold that cannot bend within a year
+maps winter days systematically low, so the bottom of the pooled sample is
+mostly December--February and any low-flow pathology concentrates there.
+Section 3's seasonal threshold removes this confound; whatever remains
+after it is data, not design.
+
+## Repeated exact values: which, how often, when
+
+```{r dupvalues}
+series_list <- list(`NTHMB sf` = xC, `BRIDG sf` = xX, `BRIDG bf` = xB)
+month_lab <- function(m) paste(sort(unique(month.abb[m])), collapse = " ")
+top_ties <- function(x, k = 10) {
+  tb <- head(sort(table(x), decreasing = TRUE), k)
+  do.call(rbind, lapply(names(tb), function(v) {
+    i <- which(x == as.numeric(v))
+    data.frame(value = as.numeric(v), n_days = length(i),
+               years = paste(range(years[i]), collapse = "-"),
+               n_years = length(unique(years[i])),
+               months = month_lab(months[i]))
+  }))
+}
+for (nm in names(series_list)) {
+  cat("\n----", nm, ": the ten most repeated exact values ----\n")
+  print(top_ties(series_list[[nm]]), row.names = FALSE)
+  x <- series_list[[nm]]
+  cat(sprintf("days whose value occurs >= 10 times: %d of %d (%.1f%%)\n",
+      sum(x %in% as.numeric(names(which(table(x) >= 10)))), N,
+      100 * mean(x %in% as.numeric(names(which(table(x) >= 10))))))
+}
+```
+
+**Reading the table.** One block per series. `value` is an exact repeated
+number; `n_days` how many days carry it; `years`/`n_years` when; `months`
+where in the year. What to look for: a value repeated hundreds of times in
+DJF across many years is a winter measurement floor (freezing); a value
+repeated only within one or two years is closer to a data-entry duplicate
+--- the professor's question "which values are these, and is it only that
+year" is answered by these columns. Large `n_days` at the series minimum is
+the floor that drew the QQ jump.
+
+## Distinct values per year, and runs of identical days
+
+```{r distinctruns, fig.height=4.2}
+op <- par(mfrow = c(1, 3), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+yrs_u <- sort(unique(years))
+for (nm in names(series_list)) {
+  x <- series_list[[nm]]
+  nd <- sapply(yrs_u, function(y) length(unique(x[years == y])) /
+                                   sum(years == y))
+  plot(yrs_u, nd, type = "h", lwd = 2, col = "steelblue4", ylim = c(0, 1),
+       xlab = "year", ylab = "share of distinct values", main = nm)
+  abline(h = 1, lty = 3, col = "grey60")
+}
+par(op)
+
+run_table <- function(x, minlen = 3) {
+  r <- rle(x)
+  i_end <- cumsum(r$lengths); i_start <- i_end - r$lengths + 1
+  keep <- r$lengths >= minlen
+  data.frame(start = dates[i_start[keep]], length = r$lengths[keep],
+             value = r$values[keep], month = months[i_start[keep]])
+}
+for (nm in names(series_list)) {
+  rt <- run_table(series_list[[nm]])
+  cat("\n----", nm, sprintf(": %d runs of >= 3 identical consecutive days ----\n",
+      nrow(rt)))
+  if (nrow(rt) > 0) {
+    print(head(rt[order(-rt$length), c("start", "length", "value")], 8),
+          row.names = FALSE)
+    print(table(month = rt$month))
+  }
+}
+```
+
+**Reading the figure and tables.** Each panel: x-axis the year, bar height
+the share of that year's 365 days carrying distinct values --- 1.0 means no
+two days of the year had exactly equal flow; visibly short bars mean the
+year is full of repeats. The runs table shows consecutive identical days
+--- a plateau: rivers vary daily, so a value frozen for a week is an
+instrument or post-processing signature, not hydrology. The month row of
+the table says where plateaus live; a DJF concentration is the freezing
+hypothesis confirmed in this series.
+
+## The floor: days at or near the minimum
+
+```{r floor}
+for (nm in names(series_list)) {
+  x <- series_list[[nm]]
+  at_min <- sum(x == min(x)); near <- sum(x <= min(x) * 1.01)
+  cat(sprintf("\n%s: min = %.4f | days exactly at min: %d | within 1%%: %d\n",
+      nm, min(x), at_min, near))
+  if (at_min > 1) {
+    i <- which(x == min(x))
+    cat("  at-min days by month:\n"); print(table(month = months[i]))
+    tab <- sort(table(years[i]), decreasing = TRUE)
+    cat("  worst years:", paste(names(tab)[1:min(5, length(tab))],
+        "(", tab[1:min(5, length(tab))], ")"), "\n")
+  }
+}
+```
+
+**Reading the output.** A minimum carried by one day is ordinary; a minimum
+carried by dozens of days is a hard floor --- a detection limit or a frozen
+gauge --- and those are exactly the days the old clamp mapped to $-2.44$.
+Their month distribution says whether the floor is a winter phenomenon;
+their year distribution says whether it is confined to particular years
+(then a targeted exclusion is defensible) or endemic (then the handling is
+a modelling decision to discuss).
+
+## Winter windows, by eye
+
+```{r winterwindows, fig.height=4.5}
+rtX <- run_table(xX); rtC <- run_table(xC)
+worst <- unique(c(format(rtX$start[order(-rtX$length)], "%Y"),
+                  format(rtC$start[order(-rtC$length)], "%Y")))
+worst <- as.integer(worst)
+worst <- worst[!is.na(worst) & worst < max(years)]
+worst <- unique(c(worst, yrs_u[2], yrs_u[5]))[1:2]
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+for (w in worst) {
+  k <- dates >= as.Date(sprintf("%d-11-01", w)) &
+       dates <= as.Date(sprintf("%d-04-30", w + 1))
+  matplot(dates[k], cbind(xC[k], xX[k]), type = "l", lty = 1, lwd = 1.6,
+          col = c("steelblue4", "firebrick3"), xlab = "date",
+          ylab = "daily flow", main = sprintf("winter %d-%d", w, w + 1))
+  legend("topright", c("NTHMB sf", "BRIDG sf"), lwd = 2, bty = "n",
+         col = c("steelblue4", "firebrick3"), cex = 0.8)
+}
+par(op)
+```
+
+**Reading the figure.** Each panel is one November--April window --- the two
+winters holding the longest identical-value plateaus, picked automatically.
+The x-axis is the date, the y-axis raw daily flow, one colour per station.
+What a measurement problem looks like: a series that locks onto a perfectly
+horizontal segment for days or weeks (a frozen or floored gauge), steps
+between a few discrete levels, or drops to a repeated identical minimum ---
+against the smooth recessions hydrology produces. These panels are the
+"identifiable by eye" evidence the meeting asked for; more winters can be
+inspected by changing `worst`.
+
+## 1968 against its neighbours
+
+```{r audit1968}
+aud <- function(df, st, var) {
+  x <- df[[var]][df$station == st]
+  c(n = length(x), distinct = length(unique(x)),
+    share_repeated = round(mean(x %in% as.numeric(names(which(table(x) >= 2)))), 3))
+}
+cmp <- rbind(`1968` = aud(d68, X_st, "sf"),
+             do.call(rbind, lapply(params$start_year:(params$start_year + 4),
+               function(y) aud(raw[raw$year == y, ], X_st, "sf"))))
+rownames(cmp)[-1] <- params$start_year:(params$start_year + 4)
+knitr::kable(cmp, caption = sprintf("BRIDG sf: 1968 (dropped) against the
+first kept years -- sample size, distinct values, share of days whose value
+repeats within the year. 1968 is excluded from the axis by decision
+(meeting 62); this table records the evidence beside the decision."))
+```
+
+# Stage 1a: the seasonal moving threshold (v8 \S2.1, eq. 3, p. 3; repair of \S4.2, p. 7)
+
+The threshold is the conditional quantile curve $u(t;\tau)$, now with two
+components: a shared periodic day-of-year cycle (one shape, learned from
+all years at once --- a cyclic basis closes December 31 onto January 1) and
+the slow trend spline across the axis. Production route: `qgam`/`mqgam` ---
+smoothing selected automatically by approximate marginal likelihood, the
+loss calibrated so intervals hold roughly their coverage (v8 \S4.4, p. 9),
+and the location-scale formula letting the loss bandwidth follow the
+strongly seasonal variance of flow. The ladder is fitted per level with no
+non-crossing constraint --- qgam's recorded first cost --- so non-crossing
+is audited and repaired by monotone rearrangement (Chernozhukov,
+Fern\'andez-Val \& Galichon 2010), with the crossing count printed: a
+near-zero count is the empirical licence for the qgam ladder. Fallback +
+consistency route: the project penalized-`rq` fitter on the same seasonal +
+trend design, $\lambda_u$ by year-block cross-validation (v8 \S4.4, p. 9).
+
+```{r qrmachinery}
+## ladder levels: low rungs added so the transform's lower tail has anchors
+taus <- c(0.01, 0.025, 0.05, seq(0.10, 0.90, by = 0.10), params$tau_star)
+K <- length(taus)
+
+make_basis <- function(tt, spacing_yr, span_yr) {
+  n_int <- max(1, floor(span_yr / spacing_yr) - 1)
+  interior <- seq_len(n_int) / (n_int + 1)
+  bs(tt, knots = interior, degree = 3, intercept = TRUE,
+     Boundary.knots = c(0, 1))
+}
+harmonics <- function(doy, n_harm = 3) {
+  do.call(cbind, lapply(seq_len(n_harm), function(k)
+    cbind(sin(2 * pi * k * doy / 366), cos(2 * pi * k * doy / 366))))
+}
+Btrend <- make_basis(tt, params$spacing_yr, span_yr)
+H <- harmonics(doy)
+Xseas <- cbind(Btrend, H)                 # seasonal + trend design, fallback
+p_tr <- ncol(Btrend)
+cat("design: trend", p_tr, "+ harmonics", ncol(H), "columns\n")
+
+year_block_folds <- function(years, K = 5) {
+  yrs <- sort(unique(years))
+  fold_of_year <- setNames(rep(seq_len(K), length.out = length(yrs)), yrs)
+  fold_of_year[as.character(years)]
+}
+folds <- year_block_folds(years, K = 5)
+
+pinball <- function(r, tau) sum(pmax(tau * r, (tau - 1) * r))
+Dtr <- cbind(diff(diag(p_tr)), matrix(0, p_tr - 1, ncol(H)))
+pen_rq_seas <- function(y, X, tau, lambda) {
+  Xa <- rbind(X, lambda * Dtr, -lambda * Dtr)
+  ya <- c(y, rep(0, 2 * nrow(Dtr)))
+  rq.fit.fnb(Xa, ya, tau = tau)$coefficients
+}
+lam_grid <- 10^(0:4)
+
+fit_ladder_own <- function(x) {
+  cvs <- sapply(lam_grid, function(lam) {
+    mean(sapply(sort(unique(folds)), function(k) {
+      tr <- folds != k
+      g <- pen_rq_seas(x[tr], Xseas[tr, , drop = FALSE], params$tau_star, lam)
+      pinball(x[!tr] - Xseas[!tr, , drop = FALSE] %*% g, params$tau_star) / sum(!tr)
+    }))
+  })
+  lam_u <- lam_grid[which.min(cvs)]
+  G <- sapply(taus, function(tau) pen_rq_seas(x, Xseas, tau, lam_u))
+  U <- Xseas %*% G
+  ncross <- sum(apply(U, 1, function(r) any(diff(r) <= 0)))
+  msize <- 0
+  if (ncross > 0) {
+    Us <- t(apply(U, 1, sort))
+    msize <- max(abs(Us - U)) / sd(x)   # size of the largest repair
+    U <- Us
+  }
+  list(U = U, lam_u = lam_u, ncross = ncross, msize = msize, route = "own")
+}
+
+fit_ladder_qgam <- function(x) {
+  tryCatch({
+    d <- data.frame(y = x, tt = tt, doy = doy)
+    fm <- list(y ~ s(doy, bs = "cc", k = params$doy_k) + s(tt, bs = "cr", k = 25),
+               ~ s(doy, bs = "cc", k = 8))
+    fitM <- mqgam(fm, data = d, qu = taus,
+                  argGam = list(knots = list(doy = c(0.5, 366.5))))
+    U <- sapply(taus, function(q) as.numeric(qdo(fitM, q, predict, newdata = d)))
+    ncross <- sum(apply(U, 1, function(r) any(diff(r) <= 0)))
+    msize <- 0
+    if (ncross > 0) {
+      Us <- t(apply(U, 1, sort))
+      msize <- max(abs(Us - U)) / sd(x)
+      U <- Us
+    }
+    list(U = U, lam_u = NA, ncross = ncross, msize = msize, route = "qgam")
+  }, error = function(e) {
+    cat("NOTE: qgam branch failed (", conditionMessage(e),
+        ") - project fallback used\n", sep = "")
+    fit_ladder_own(x)
+  })
+}
+fit_ladder <- function(x) if (has["qgam"]) fit_ladder_qgam(x) else fit_ladder_own(x)
+
+fit_ladder_cached <- function(x, tag) {
+  f <- sprintf("cache_ladder_%s_%s_%d_%.0f.rds", tag,
+               ifelse(has["qgam"], "qgam", "own"), N, sum(x))
+  if (!params$refit_ladders && file.exists(f)) {
+    out <- readRDS(f)
+    cat("ladder", tag, "loaded from cache:", f, "\n")
+    return(out)
+  }
+  out <- fit_ladder(x); saveRDS(out, f)
+  cat("ladder", tag, "fitted and cached:", f, "\n")
+  out
+}
+```
+
+```{r thresholdfit}
+mC <- fit_ladder_cached(xC, "C"); mX <- fit_ladder_cached(xX, "X")
+mB <- fit_ladder_cached(xB, "B")
+knitr::kable(data.frame(
+  series = c("NTHMB sf (C)", "BRIDG sf (X)", "BRIDG bf (B)"),
+  route = c(mC$route, mX$route, mB$route),
+  crossing_days_repaired = c(mC$ncross, mX$ncross, mB$ncross),
+  largest_repair_sd = round(c(mC$msize, mX$msize, mB$msize), 4)),
+  caption = "Threshold ladders: route actually used, and the non-crossing
+  audit. Rungs are fitted independently (qgam's recorded first cost), so
+  crossings can occur -- typically hairline overlaps among the
+  tightly-spaced low rungs, which the monotone rearrangement repairs
+  (Chernozhukov et al. 2010: the repair never worsens the estimate). The
+  count says how often; the last column says how BIG the largest repair
+  was, in sd units of the series -- a large count with a tiny magnitude is
+  cosmetic, a large magnitude localizes a real fitting problem.")
+
+## consistency check where the package route ran (project-brief discipline)
+if (mX$route == "qgam") {
+  own <- fit_ladder_own(xX)
+  gap <- mean(abs(own$U[, K] - mX$U[, K])) / sd(xX)
+  cat(sprintf("qgam vs project top-rung mean gap: %.4f sd units (different
+  smoothing selection and seasonal bases; reported, not asserted)\n", gap))
+} else if (has["qgam"]) {
+  cat("WARNING: qgam is installed but its branch did not produce the ladder
+  (see NOTE above) - no qgam-vs-project gap to report\n")
+}
+```
+
+## The threshold seen at year scale (meeting 62, the second problem)
+
+```{r thresholdplot, fig.height=4.5}
+op <- par(mfrow = c(1, 3), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+show <- c(which.min(abs(taus - 0.05)), which.min(abs(taus - 0.5)), K)
+lcol <- c("grey40", "steelblue3", "firebrick3")
+for (s in list(list(xC, mC, "NTHMB sf (C)"), list(xX, mX, "BRIDG sf (X)"),
+               list(xB, mB, "BRIDG bf (B)"))) {
+  plot(dates, s[[1]], pch = ".", col = "grey80", xlab = "year",
+       ylab = "daily flow", main = s[[3]])
+  for (j in seq_along(show))
+    lines(dates, s[[2]]$U[, show[j]], lwd = 1.2, col = lcol[j])
+  legend("topleft", paste0("tau = ", taus[show]), col = lcol, lwd = 2,
+         bty = "n", cex = 0.8)
+}
+par(op)
+```
+
+**Reading the figure.** One panel per series; x-axis calendar time, y-axis
+daily flow, grey dots the raw series. The curves are three rungs of the
+ladder: $\tau = 0.05$ (lower envelope), $\tau = 0.5$ (the moving median ---
+the closest analogue of a location curve $\mu(t)$ in this threshold-based
+route), and $\tau^{*} = 0.95$, the working threshold: the GP tail is fitted
+to overshoots above the red curve. Unlike a trend-only fit, these curves
+now oscillate within each year --- the seasonal cycle --- while their
+year-to-year drift carries the climate signal. At this compression the
+seasonal band looks solid; the next figure zooms in.
+
+```{r thresholdwindows, fig.width=9.5, fig.height=4}
+xCbf <- get_series(C_st, "bf")
+mCbf <- fit_ladder_cached(xCbf, "Cbf")   # NTHMB baseflow ladder (one-time fit)
+ser4 <- list(list(xC, mC, "NTHMB sf"), list(xX, mX, "BRIDG sf"),
+             list(xCbf, mCbf, "NTHMB bf"), list(xB, mB, "BRIDG bf"))
+set.seed(62)                              # reproducible window draw
+for (s in ser4) {
+  for (zy in sort(sample(min(years):(max(years) - 1), 5))) {
+    k <- years %in% c(zy, zy + 1)
+    sh <- mean(s[[1]][k] > s[[2]]$U[k, K])
+    plot(dates[k], s[[1]][k], pch = 16, cex = 0.4, col = "grey60",
+         xlab = "date", ylab = paste(s[[3]], "daily flow"),
+         main = sprintf("%s %d-%d | share above u(t; %.2f): %.3f",
+                        s[[3]], zy, zy + 1, params$tau_star, sh))
+    lines(dates[k], s[[2]]$U[k, K], lwd = 2, col = "firebrick3")
+    lines(dates[k], s[[2]]$U[k, which.min(abs(taus - 0.5))], lwd = 2,
+          col = "steelblue3")
+    legend("topleft", c(sprintf("u(t; %.2f)", params$tau_star), "median rung"),
+           lwd = 2, col = c("firebrick3", "steelblue3"), bty = "n", cex = 0.85)
+  }
+}
+```
+
+**Reading the figures.** Twenty separate panels: for each of the four series
+(both stations, streamflow and baseflow), five randomly drawn two-year
+windows spread over the axis. Dots are daily values; red is the working
+threshold $u(t;\tau^{*})$, blue the moving median. The threshold should ride
+the seasonal wave --- high through the freshet, low through winter --- and
+the number in each title is that window's own share of days above red.
+Target 0.05; a two-year window holds about 730 days, so roughly 0.03--0.07
+is sampling noise, while a title far outside that range localizes a
+miscalibrated stretch (compare with the season-by-era table). The windows
+are drawn with a fixed seed, so every knit shows the same ten years; change
+`set.seed(62)` to draw a different sample.
+
+## Local exceedance proportions (the "5\% locally" check)
+
+```{r localexceed, fig.height=4}
+seas_of <- function(m) c("DJF","DJF","MAM","MAM","MAM","JJA",
+                         "JJA","JJA","SON","SON","SON","DJF")[m]
+seas <- seas_of(months)
+era <- cut(years, breaks = seq(min(years), max(years) + 22, by = 22),
+           right = FALSE, dig.lab = 4)
+excX <- xX > mX$U[, K]
+tab <- round(tapply(excX, list(seas, era), mean), 3)
+knitr::kable(tab, caption = sprintf("BRIDG: share of days above u(t; %.2f)
+by season and era. Target %.2f in every cell -- locally, not just pooled
+(meeting 62). A cell far below target says the threshold missed that
+season's level in that era.", params$tau_star, 1 - params$tau_star))
+
+sh <- sapply(yrs_u, function(y) mean(excX[years == y]))
+plot(yrs_u, sh, type = "h", lwd = 2, col = "steelblue4",
+     xlab = "year", ylab = "share above threshold",
+     main = sprintf("BRIDG: yearly share above u(t; %.2f)", params$tau_star))
+abline(h = 1 - params$tau_star, col = "firebrick3", lwd = 2, lty = 2)
+```
+
+**Reading the figure and table.** Table: rows are seasons, columns eras;
+each cell the share of that season-era's days above the working threshold.
+The design target is `r 1 - params$tau_star` everywhere --- the moving
+threshold's defining property (v8 \S3, p. 4), now demanded per season as
+well as per era. Figure: the same share per calendar year against the
+dashed target line; wandering above and below is sampling noise, a
+sustained drift is a threshold failure. This is also qgam's own recommended
+bias check for its smoothed loss --- one table serves both purposes. If the
+cells miss the target in a season-by-era *pattern* --- one season too low
+early and too high late --- the additive design (one seasonal shape shared
+by every year, plus a trend) is too rigid, and the next design step is the
+tensor interaction `te(doy, tt)`: the seasonal shape itself allowed to
+drift, which the qgam route fits with one formula change.
+
+## The tensor experiment: does the seasonal shape itself drift?
+
+```{r tethreshold}
+if (has["qgam"]) {
+  f_te <- sprintf("cache_uX_te_qgam_%d_%.0f.rds", N, sum(xX))
+  u_te <- tryCatch({
+    if (!params$refit_ladders && file.exists(f_te)) readRDS(f_te) else {
+      d <- data.frame(y = xX, tt = tt, doy = doy)
+      fm <- list(y ~ te(doy, tt, bs = c("cc", "cr"), k = c(10, 15)),
+                 ~ s(doy, bs = "cc", k = 8))
+      kn <- list(knots = list(doy = c(0.5, 366.5)))
+      fte <- qgam(fm, data = d, qu = params$tau_star, argGam = kn)
+      u1 <- as.numeric(predict(fte, newdata = d))
+      saveRDS(u1, f_te); u1
+    }
+  }, error = function(e) {
+    cat("NOTE: te branch failed (", conditionMessage(e), ")\n", sep = ""); NULL })
+  if (!is.null(u_te)) {
+    tab_te <- round(tapply(xX > u_te, list(seas, era), mean), 3)
+    knitr::kable(tab_te, caption = "BRIDG, tensor te(doy, tt) threshold at
+    0.95: the season x era exceedance table again. If the additive design's
+    first-era misses shrink toward 0.05 here, the seasonal shape itself
+    drifts across the century and the tensor becomes the production design.")
+  }
+} else cat("qgam absent in this environment - te experiment skipped\n")
+```
+
+## Move one at the threshold (v8 \S4.6, p. 10)
+
+```{r thrmove1}
+thr_move1 <- function(x, B = 30) {
+  Xlin <- cbind(1, tt, H)
+  sl <- rq.fit.fnb(Xlin, x, tau = params$tau_star)$coefficients[2]
+  yrs <- unique(years)
+  reps <- replicate(B, {
+    keep <- years %in% sample(yrs, replace = TRUE)
+    rq.fit.fnb(Xlin[keep, ], x[keep], tau = params$tau_star)$coefficients[2]
+  })
+  c(slope_tt = sl, se = sd(reps), z = sl / sd(reps))
+}
+knitr::kable(round(rbind(`NTHMB sf` = thr_move1(xC), `BRIDG sf` = thr_move1(xX),
+                         `BRIDG bf` = thr_move1(xB)), 3),
+             caption = "Move one at the threshold: the trend slope of the
+             linear-in-t rung (seasonal harmonics included in both models,
+             so the slope is the trend, not the seasons) against its
+             year-block bootstrap SE. A constant winning is a legitimate
+             outcome (v8 Sec 4.6, p. 10).")
+```
+
+# Stage 1b: GP tail (v8 \S2.2, eq. 4, p. 3)
+
+The scale $\sigma(t)$ gets the same seasonal + trend structure as the
+threshold --- with a seasonal threshold, winter exceedances exist and their
+overshoots are far smaller than freshet overshoots, so a seasonal scale is
+not optional. The shape $\xi$ stays constant per series (decided; v8 \S2.2,
+p. 3) and is printed --- the number to quote when asked. Production route:
+evgam (`family = "gpd"`, REML smoothing); fallback + check: the project
+penalized likelihood on the seasonal + trend design.
+
+```{r gpmachinery}
+gp_nll <- function(par, y, Xg, lambda = 0, Dg = NULL) {
+  pg <- ncol(Xg)
+  gam <- par[1:pg]; xi <- par[pg + 1]
+  sig <- exp(as.vector(Xg %*% gam))
+  z <- 1 + xi * y / sig
+  if (any(z <= 0)) return(1e10)
+  nll <- sum(log(sig) + (1 + 1 / xi) * log(z))
+  if (!is.null(Dg) && lambda > 0) nll <- nll + lambda * sum((Dg %*% gam)^2)
+  nll
+}
+fit_gp_basis <- function(y, Xg, lambda = 0, Dg = NULL) {
+  init <- c(log(mean(y)), rep(0, ncol(Xg) - 1), 0.05)
+  o <- optim(init, gp_nll, y = y, Xg = Xg, lambda = lambda, Dg = Dg,
+             method = "BFGS", control = list(maxit = 600))
+  list(gam = o$par[1:ncol(Xg)], xi = o$par[ncol(Xg) + 1], nll = o$value)
+}
+
+fit_gp_own <- function(x, ladder) {
+  u <- ladder$U[, K]; exc <- x > u
+  y <- (x - u)[exc]
+  Xg  <- cbind(Btrend, H)[exc, , drop = FALSE]
+  fe <- folds[exc]
+  ## move one: harmonics in both, trend column the difference
+  f0 <- fit_gp_basis(y, cbind(1, H[exc, , drop = FALSE]))
+  f1 <- fit_gp_basis(y, cbind(1, tt[exc], H[exc, , drop = FALSE]))
+  LRT <- 2 * (f0$nll - f1$nll)
+  cvs <- sapply(lam_grid, function(lam) {
+    mean(sapply(sort(unique(fe)), function(k) {
+      tr <- fe != k
+      f <- fit_gp_basis(y[tr], Xg[tr, , drop = FALSE], lam, Dtr)
+      gp_nll(c(f$gam, f$xi), y[!tr], Xg[!tr, , drop = FALSE]) / sum(!tr)
+    }))
+  })
+  lam_s <- lam_grid[which.min(cvs)]
+  fs <- fit_gp_basis(y, Xg, lam_s, Dtr)
+  sig <- exp(as.vector(cbind(Btrend, H) %*% fs$gam))
+  list(exc = exc, u = u, n_exc = sum(exc), const = f0, lin = f1,
+       LRT = LRT, p = 1 - pchisq(LRT, 1), lam_s = lam_s,
+       sig = sig, xi = fs$xi, route = "own")
+}
+
+fit_gp_evgam <- function(x, ladder) {
+  tryCatch({
+    u <- ladder$U[, K]; exc <- x > u
+    d <- data.frame(y = (x - u)[exc], tt = tt[exc], doy = doy[exc])
+    f <- evgam::evgam(list(y ~ s(doy, bs = "cc", k = 8) + s(tt, k = 15), ~ 1),
+                      data = d, family = "gpd",
+                      knots = list(doy = c(0.5, 366.5)))
+    pr <- predict(f, newdata = data.frame(tt = tt, doy = doy),
+                  type = "response")
+    sig <- as.numeric(pr[[1]]); xi <- as.numeric(pr[[2]][1])
+    own <- fit_gp_own(x, ladder)
+    gapc <- max(abs(sig - own$sig) / own$sig)
+    cat(sprintf("evgam vs project sigma(t): max relative gap %.3f (REML vs
+    CV smoothing; reported, not asserted)\n", gapc))
+    out <- own
+    out$sig <- sig; out$xi <- xi; out$route <- "evgam"
+    out
+  }, error = function(e) {
+    cat("NOTE: evgam branch failed (", conditionMessage(e),
+        ") - project fallback used\n", sep = "")
+    fit_gp_own(x, ladder)
+  })
+}
+fit_gp_stage <- function(x, ladder)
+  if (has["evgam"]) fit_gp_evgam(x, ladder) else fit_gp_own(x, ladder)
+```
+
+```{r gpfit}
+gC <- fit_gp_stage(xC, mC); gX <- fit_gp_stage(xX, mX); gB <- fit_gp_stage(xB, mB)
+knitr::kable(data.frame(
+  series = c("NTHMB sf", "BRIDG sf", "BRIDG bf"),
+  route = c(gC$route, gX$route, gB$route),
+  n_exc = c(gC$n_exc, gX$n_exc, gB$n_exc),
+  xi = round(c(gC$xi, gX$xi, gB$xi), 3),
+  LRT_trend = round(c(gC$LRT, gX$LRT, gB$LRT), 2),
+  p_value = signif(c(gC$p, gX$p, gB$p), 2)),
+  caption = "GP stage: route actually used, exceedance count, the constant
+  shape xi (the number to quote), and move one for the trend in log sigma
+  (LRT vs chi-squared(1), harmonics in both candidates).")
+
+## sigma(t) in chunks -- the meeting's 'look at the scale in smaller pieces'
+sig_tab <- round(rbind(
+  `NTHMB sf` = tapply(gC$sig, list(era), mean),
+  `BRIDG sf` = tapply(gX$sig, list(era), mean),
+  `BRIDG bf` = tapply(gB$sig, list(era), mean)), 2)
+knitr::kable(sig_tab, caption = "Mean fitted GP scale sigma(t) by era: the
+chunked view of the scale curve. Read along a row for the trend in typical
+overshoot size.")
+```
+
+```{r gpseason, fig.height=4.2}
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+excd <- xX > mX$U[, K]
+boxplot((xX - mX$U[, K])[excd] ~ months[excd], col = "grey92",
+        xlab = "month", ylab = "raw excess",
+        main = "BRIDG raw excesses by month")
+boxplot(((xX - mX$U[, K]) / gX$sig)[excd] ~ months[excd], col = "grey92",
+        xlab = "month", ylab = "excess / sigma(t)",
+        main = "BRIDG standardized excesses by month")
+par(op)
+```
+
+**Reading the figure.** Left: the raw overshoots above the threshold, by
+calendar month of occurrence --- with a seasonal threshold there are
+exceedance days in every month, and their raw sizes may legitimately differ
+by season (freshet overshoots are physically larger). Right: the same
+excesses divided by the fitted seasonal $\sigma(t)$ --- if the scale model
+has absorbed the seasonality, these boxes should be level across months
+with no drift; a remaining monthly pattern here is the meeting's "excesses
+still seasonal" failure, localized to the GP stage rather than the
+threshold.
+
+## Per-season GP shape probe
+
+```{r gpseasonshape}
+gp_seas <- do.call(rbind, lapply(c("DJF", "MAM", "JJA", "SON"), function(sn) {
+  e <- excd & seas == sn
+  y <- ((xX - mX$U[, K]) / gX$sig)[e]
+  f <- fit_gp_basis(y, matrix(1, sum(e), 1))
+  data.frame(season = sn, n = sum(e), sigma_std = round(exp(f$gam[1]), 3),
+             xi = round(f$xi, 3))
+}))
+knitr::kable(gp_seas, row.names = FALSE, caption = sprintf("Per-season GP on
+sigma(t)-standardized BRIDG excesses. If the seasonal scale model is right,
+sigma_std sits near 1 in every row. The xi column probes the constant-shape
+decision (pooled xi = %.3f): a DJF value far above the others is the heavy
+winter tail seen in the Exp(1) panels, and the case to discuss before ever
+freeing xi.", gX$xi))
+```
+
+# Stage 1c: transform to Laplace, and the gates (v8 \S3, eqs. 5--6, pp. 3--4)
+
+The two fitted pieces assemble into $F(x;t)$ --- ladder interpolation in
+the body, GP tail above $u(t;\tau^{*})$ (v8 eq. 5, p. 3) --- and each day's
+value maps through its own day's $F$ to the standard Laplace scale (v8 eq.
+6, p. 4; Keef et al. 2013 eq. 2.1). Below the bottom rung ($\tau = 0.01$)
+the lower tail decays exponentially, matched continuously to the bottom
+ladder segment; the numerical floor sits at $1/(4N)$ and the count of days
+reaching it is printed --- the old transform's hard clamp at $10^{-5}$,
+which collapsed the lowest days onto the single value $-2.44$ and drew the
+flat-then-jump QQ artifact, is gone, and this instrumentation proves it on
+every knit.
+
+```{r transform}
+qlap <- function(p) ifelse(p < 0.5, log(2 * p), -log(2 * (1 - p)))
+plap <- function(y) ifelse(y < 0, exp(y) / 2, 1 - exp(-y) / 2)
+
+F_of <- function(x, ladder, gp) {
+  U <- ladder$U
+  Fv <- rep(NA_real_, length(x))
+  above <- x > U[, K]
+  S <- (1 + gp$xi * (x - U[, K]) / gp$sig)
+  Fv[above] <- 1 - (1 - params$tau_star) * pmax(S[above], 0)^(-1 / gp$xi)
+  for (k in seq_len(K - 1)) {
+    m <- !above & x > U[, k] & x <= U[, k + 1]
+    Fv[m] <- taus[k] + (taus[k + 1] - taus[k]) *
+             (x[m] - U[m, k]) / (U[m, k + 1] - U[m, k])
+  }
+  low <- !above & x <= U[, 1]
+  beta1 <- (U[, 2] - U[, 1]) / log(taus[2] / taus[1])   # continuous match
+  Fv[low] <- taus[1] * exp((x[low] - U[low, 1]) / beta1[low])
+  n_low <- sum(low); n_floor <- sum(Fv[low] <= 1 / (4 * N))
+  cat(sprintf("  below bottom rung: %d days (%.2f%%); at numerical floor: %d\n",
+      n_low, 100 * n_low / length(x), n_floor))
+  pmin(pmax(Fv, 1 / (4 * N)), 1 - 1e-9)
+}
+cat("NTHMB sf:\n"); FC <- F_of(xC, mC, gC)
+cat("BRIDG sf:\n"); FX <- F_of(xX, mX, gX)
+cat("BRIDG bf:\n"); FB <- F_of(xB, mB, gB)
+YC <- qlap(FC); YX <- qlap(FX); YB <- qlap(FB)
+y_star <- -log(2 * (1 - params$tau_star))    # 2.303 at 0.95 (v8 Sec 3, p. 4)
+```
+
+```{r pitgate, fig.height=4}
+op <- par(mfrow = c(1, 3), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+for (nm in c("FC", "FX", "FB")) {
+  hist(get(nm), breaks = 40, col = "grey88", border = "white", freq = FALSE,
+       xlab = "fitted F(x; t)", main = paste("gate:",
+       c(FC = "NTHMB sf", FX = "BRIDG sf", FB = "BRIDG bf")[nm]))
+  abline(h = 1, col = "firebrick3", lwd = 2)
+}
+par(op)
+```
+
+**Reading the figure.** The gate of stage 1 (v8 \S3, p. 4). The x-axis is
+each day's fitted probability under its own day's distribution; the y-axis
+density. If the marginal model is right these are Unif(0,1): flat bars on
+the red line. A spike in the first bar was the old clamp's signature; a
+bump near 1 says the tail is too light; waves in the body point at the
+ladder; and --- the meeting's verdict on the previous version --- a shape
+that reappears when sliced by season is the seasonality the margins missed,
+which the seasonal basis exists to remove. Downstream stages wait here.
+
+## Attributing the histogram: rung audit, per-bar noise band, residual maps
+
+```{r rungaudit}
+rung_audit <- function(x, ladder)
+  sapply(seq_len(K), function(k) mean(x <= ladder$U[, k]) - taus[k])
+ra <- round(rbind(`NTHMB sf` = rung_audit(xC, mC),
+                  `BRIDG sf` = rung_audit(xX, mX),
+                  `BRIDG bf` = rung_audit(xB, mB)), 4)
+colnames(ra) <- paste0("tau=", taus)
+knitr::kable(ra, caption = "Rung calibration audit: share of days at or
+below each fitted rung, minus its target tau. Zero everywhere = a perfectly
+calibrated ladder; a negative entry at tau = 0.01 means the bottom rung sits
+too low (the short first histogram bar); an interior entry off zero places a
+histogram wave at that rung of the qgam fit.")
+
+ra_era <- sapply(seq_len(K), function(k)
+  tapply(xX <= mX$U[, k], era, mean) - taus[k])
+colnames(ra_era) <- paste0("tau=", taus)
+knitr::kable(round(ra_era, 3), caption = "BRIDG sf: the same audit per era
+-- an entry changing sign along a row is drift the additive seasonal basis
+missed (the te case), not a global rung offset.")
+```
+
+```{r pitdev, fig.width=9.5, fig.height=4}
+brks <- seq(0, 1, by = 0.025); mids <- brks[-1] - 0.0125
+for (nm in c("FC", "FX", "FB")) {
+  Fv <- get(nm); lab <- c(FC = "NTHMB sf", FX = "BRIDG sf", FB = "BRIDG bf")[nm]
+  dens <- hist(Fv, breaks = brks, plot = FALSE)$density
+  bootd <- replicate(200, {
+    ky <- years %in% sample(unique(years), replace = TRUE)
+    hist(Fv[ky], breaks = brks, plot = FALSE)$density
+  })
+  bb <- apply(bootd, 1, quantile, c(0.025, 0.975))
+  bad <- which(bb[1, ] > 1 | bb[2, ] < 1)
+  plot(mids, dens, type = "h", lwd = 5, col = "grey70",
+       ylim = range(bb, dens, 1), xlab = "fitted F(x; t)", ylab = "density",
+       main = paste(lab, "- bars whose year-block band excludes 1 are red"))
+  segments(mids, bb[1, ], mids, bb[2, ], col = adjustcolor("steelblue3", 0.6))
+  abline(h = 1, col = "firebrick3", lwd = 2)
+  points(mids[bad], dens[bad], pch = 16, col = "firebrick3")
+  cat(lab, "- genuinely off bins at:",
+      paste(sprintf("%.3f", mids[bad]), collapse = " "), "\n")
+}
+```
+
+**Reading the figure.** Each blue segment answers: how much would this bar
+move if history had dealt a different set of years? Two hundred re-draws of
+whole years (the block that preserves clusters and seasons), the 2.5--97.5%
+range per bar; a bar is flagged red only when its whole interval misses 1
+--- structural, not year-to-year luck. The fit is not redone per replicate,
+so this measures sampling noise, not fit uncertainty.
+
+```{r pitwho, fig.width=9.5, fig.height=4.5}
+comp_map <- function(Fv, fac, main) {
+  nb <- length(brks) - 1
+  Ocnt <- table(fac, cut(Fv, brks, include.lowest = TRUE))
+  Ecnt <- rowSums(Ocnt) %o% rep(1 / nb, nb)
+  R <- (Ocnt - Ecnt) / sqrt(Ecnt)
+  image(1:nb, 1:nrow(R), t(R[nrow(R):1, ]), zlim = c(-6, 6),
+        col = hcl.colors(25, "Blue-Red 2"), xlab = "PIT bin (low to high F)",
+        ylab = "", yaxt = "n", main = main)
+  axis(2, at = 1:nrow(R), labels = rev(rownames(R)), las = 2, cex.axis = 0.7)
+  wr <- which(abs(R) == max(abs(R)), arr.ind = TRUE)[1, ]
+  cat(main, "| largest cell:", rownames(R)[wr[1]],
+      sprintf("bin (%.3f, %.3f], residual %+.1f\n",
+              brks[wr[2]], brks[wr[2] + 1], R[wr[1], wr[2]]))
+}
+mon <- factor(month.abb[months], levels = month.abb)
+comp_map(FC, mon, "NTHMB sf: month x PIT bin (red = too many days)")
+comp_map(FC, era, "NTHMB sf: era x PIT bin")
+comp_map(FX, mon, "BRIDG sf: month x PIT bin")
+comp_map(FX, era, "BRIDG sf: era x PIT bin")
+```
+
+**Reading the maps.** Cells are Pearson residuals (O - E)/sqrt(E) of a
+month-by-bin (or era-by-bin) table under within-slice uniformity: |R| <= 2
+is noise, |R| >= 4 is structure; look for stripes, not lone cells. A month
+row stripe = residual seasonality (the forbidden outcome); a bin column
+stripe = one rung miscalibrated for all months (ladder tuning); an era row
+stripe = drift the additive basis missed (the te case).
+
+## Pooled and sliced Laplace QQ (v8 \S3, p. 4)
+
+```{r slicedqq, fig.height=7}
+qq_laplace <- function(y, main) {
+  n <- length(y); th <- qlap((1:n) / (n + 1))
+  plot(th, sort(y), pch = 16, cex = 0.35, col = "steelblue4",
+       xlab = "Laplace quantiles", ylab = "sample", main = main,
+       cex.main = 0.9)
+  abline(0, 1, col = "grey55"); abline(h = y_star, v = y_star,
+                                       col = "grey85", lty = 3)
+}
+dec1 <- min(years):(min(years) + 9)
+dec2 <- (max(years) - 9):max(years)
+op <- par(mfrow = c(2, 5), mar = c(3, 3, 2, 0.6), mgp = c(1.9, 0.6, 0))
+for (yv in list(c("YC", "NTHMB"), c("YX", "BRIDG"))) {
+  Y <- get(yv[1])
+  qq_laplace(Y, paste(yv[2], "pooled"))
+  qq_laplace(Y[seas == "DJF"], paste(yv[2], "DJF"))
+  qq_laplace(Y[seas == "JJA"], paste(yv[2], "JJA"))
+  qq_laplace(Y[years %in% dec1], paste(yv[2], min(dec1), "-", max(dec1)))
+  qq_laplace(Y[years %in% dec2], paste(yv[2], min(dec2), "-", max(dec2)))
+}
+par(op)
+```
+
+**Reading the figure.** Rows are stations; columns are the pooled sample,
+two season slices, and the first and last decades. Each panel plots sorted
+Laplace-scale values against standard Laplace quantiles; the grey diagonal
+is perfect agreement and the dotted lines mark $y^{*}$, where the
+dependence stage begins. The pooled panel's body is near-straight almost by
+construction (the ladder interpolation tracks the data); its information is
+the corner beyond $y^{*}$, where the GP does real work --- and the lower
+tail, where the old clamp's flat-run-then-jump would sit: a remaining short
+flat segment there is genuine ties in the data (Section 2's forensics name
+them), not the transform. The season panels are the meeting's test: with
+the seasonal margins they must hug the line --- a summer slice shifted
+bodily off the diagonal was the trend-only design's signature and must be
+gone. Decade panels off the line say the slow curves missed the drift.
+
+```{r excexp, fig.height=4}
+op <- par(mfrow = c(1, 4), mar = c(3, 3, 2, 0.6), mgp = c(1.9, 0.6, 0))
+for (sn in c("DJF", "MAM", "JJA", "SON")) {
+  e <- YC[seas == sn & YC > y_star] - y_star
+  if (length(e) > 10) {
+    n <- length(e); th <- -log(1 - (1:n) / (n + 1))
+    plot(th, sort(e), pch = 16, cex = 0.4, col = "steelblue4",
+         xlab = "Exp(1) quantiles", ylab = "excess above y*",
+         main = paste("NTHMB", sn, "(n =", n, ")"), cex.main = 0.9)
+    abline(0, 1, col = "grey55")
+  } else plot.new()
+}
+par(op)
+```
+
+**Reading the figure.** The decisive tail check (v8 \S3, p. 4): on the
+Laplace scale the excesses $Y - y^{*}$ above the dependence threshold are
+exactly unit exponential if the transform is honest, so each season's
+exceedances are QQ-plotted against Exp(1). These are the very days the
+dependence stage consumes --- if these panels pass, stage 2 stands on solid
+ground even where the deep winter body is imperfect. Panel headers carry
+the exceedance count per season: with a seasonal threshold every season
+contributes days, and a season with almost none is itself information.
+
+```{r decshare}
+dec_all <- (years - min(years)) %/% 10
+share <- t(sapply(list(NTHMB = YC, BRIDG = YX), function(Y)
+  round(tapply(Y > y_star, dec_all, mean), 3)))
+colnames(share) <- paste0(min(years) + 10 * as.integer(colnames(share)), "s")
+knitr::kable(share, caption = sprintf("Share of days above y* = %.3f per
+decade; target %.2f in every cell (v8 Sec 3, p. 4 -- the moving threshold's
+purpose, LL20).", y_star, 1 - params$tau_star))
+```
+
+# Stage 2: the dependence model (v8 \S5, eq. 8, p. 11) --- project code
+
+No package fits the non-stationary Heffernan--Tawn model, so this fitter is
+the project's one self-implemented core. On the Laplace scale $a(t) \in
+[-1, 1]$ (link $a = 2\,\mathrm{plogis}(\eta) - 1$) and $b(t) < 1$; the
+working likelihood stays Gaussian --- Keef et al. tested Normal against
+Laplace working residuals and kept the Normal (v8 \S5, p. 13) --- and the
+maximization carries the Keef ordering constraint (v8 eq. 9, p. 13): beyond
+the data the fitted conditional quantiles may not exceed what perfect
+positive dependence would give, nor undercut perfect negative dependence.
+The constraint is imposed at $v_K$ above the largest observed conditioning
+value (v8 \S3, p. 4), checked at the residual range endpoints, and --- our
+flagged extension --- pointwise in $t$ for curve models. Verification is
+two-tier: the all-constant case against texmex *on its defaults* (Laplace
+margins, Keef constraints --- the reference implementation, v8 \S4.5, p. 10),
+and the fixed-$b$ linear case against `mgcv::gam(gaulss)`.
+
+```{r winchi, fig.width=9.5, fig.height=4.5}
+pobs <- function(x) rank(x, ties.method = "average") / (length(x) + 1)
+win_chi <- function(c1, c2, y0, y1, u = 0.95) {
+  k <- years >= y0 & years <= y1
+  uu <- pobs(c1[k]); vv <- pobs(c2[k])
+  sum(uu > u & vv > u) / (sum(k) * (1 - u))
+}
+w_starts <- seq(min(years), max(years) - 5, by = 1)
+chi_seq <- sapply(w_starts, function(y0) win_chi(xC, xX, y0, y0 + 5))
+plot(w_starts + 2.5, chi_seq, pch = 16, cex = 0.6, col = "steelblue4",
+     ylim = c(0, max(chi_seq) * 1.1), xlab = "window centre (year)",
+     ylab = "chi(0.95), 6-year window",
+     main = "Model-free screening: windowed chi, BRIDG-NTHMB, this file")
+lines(lowess(w_starts + 2.5, chi_seq, f = 0.3), col = "firebrick3", lwd = 2)
+abline(h = 0.05, lty = 2, col = "grey55")
+cat(sprintf("windowed chi: mean of first 10 windows %.3f | last 10 %.3f\n",
+    mean(head(chi_seq, 10)), mean(tail(chi_seq, 10))))
+```
+
+**Reading the figure.** Each dot is one six-year window: the share of days
+on which both stations exceed their own pooled 0.95 rank level, divided by
+5% --- the empirical chi(0.95), computed from ranks alone, no model. The
+dashed line marks independence; near 1 is asymptotic dependence; the red
+curve is the smoothed path. This is the yardstick every fitted dependence
+result must face: if the fitted a(t) is flat while this curve climbs, the
+fit is losing a real signal.
+
+```{r htmachinery}
+v_dep <- -log(2 * (1 - params$kappa))
+keep <- YC > v_dep
+yCe <- YC[keep]; yXe <- YX[keep]; tte <- tt[keep]
+fe <- folds[keep]; ye <- years[keep]
+n_e <- sum(keep); cat("exceedance days above v =", round(v_dep, 3), ":", n_e, "\n")
+
+v_K <- max(yCe) + 0.5
+zp <- range(yXe - yCe); zm <- range(yXe + yCe)   # Keef bound residual ranges
+
+Bdep <- make_basis(tt, 2 * params$spacing_yr, span_yr)
+Bde <- Bdep[keep, , drop = FALSE]
+p_dep <- ncol(Bdep)
+tdec <- quantile(tte, 0:10 / 10)                  # constraint checked here
+
+keef_on <- TRUE
+keef_viol <- function(a_v, b_v, Wlo, Whi) {
+  if (!keef_on) return(FALSE)
+  ## ordering (v8 eq. 9, p. 13) at y in {v_K, v_K + 3}, q in {0, 1},
+  ## for each (a, b) supplied (deciles of t for curve models)
+  for (y in c(v_K, v_K + 3)) {
+    lo <- a_v * y + y^b_v * Wlo; hi <- a_v * y + y^b_v * Whi
+    if (any(hi > y + zp[2]) || any(lo < -y + zm[1])) return(TRUE)
+  }
+  FALSE
+}
+
+ht_nll <- function(theta, yC, yX, Bmat, lambda = 0, w = c(1, 1, 10, 10),
+                   Bchk = NULL) {
+  p <- ncol(Bmat)
+  ga <- theta[1:p]; gb <- theta[(p+1):(2*p)]
+  gm <- theta[(2*p+1):(3*p)]; gs <- theta[(3*p+1):(4*p)]
+  a <- 2 * plogis(as.vector(Bmat %*% ga)) - 1
+  b <- as.vector(Bmat %*% gb)
+  m <- as.vector(Bmat %*% gm); s <- exp(as.vector(Bmat %*% gs))
+  if (any(b > 0.999)) return(1e10)
+  loc <- a * yC + m * yC^b; sc <- s * yC^b
+  if (any(!is.finite(sc)) || any(sc <= 0)) return(1e10)
+  W <- (yX - a * yC) / yC^b
+  if (is.null(Bchk)) Bchk <- Bmat[c(1, nrow(Bmat)), , drop = FALSE]
+  a_chk <- 2 * plogis(as.vector(Bchk %*% ga)) - 1
+  b_chk <- as.vector(Bchk %*% gb)
+  if (keef_viol(a_chk, b_chk, min(W), max(W))) return(1e10)
+  sum(log(sc) + 0.5 * ((yX - loc) / sc)^2) +
+    lambda * (w[1] * sum(diff(ga)^2) + w[2] * sum(diff(gb)^2) +
+              w[3] * sum(diff(gm)^2) + w[4] * sum(diff(gs)^2))
+}
+fit_ht_basis <- function(yC, yX, Bmat, lambda = 0, init = NULL, Bchk = NULL) {
+  p <- ncol(Bmat)
+  if (is.null(init)) init <- c(rep(0, p), rep(0.2, p), rep(0, p), rep(0, p))
+  optim(init, ht_nll, yC = yC, yX = yX, Bmat = Bmat, lambda = lambda,
+        Bchk = Bchk, method = "BFGS", control = list(maxit = 800))
+}
+curves_of <- function(theta, Bmat) {
+  p <- ncol(Bmat)
+  list(a = 2 * plogis(as.vector(Bmat %*% theta[1:p])) - 1,
+       b = as.vector(Bmat %*% theta[(p+1):(2*p)]),
+       m = as.vector(Bmat %*% theta[(2*p+1):(3*p)]),
+       s = exp(as.vector(Bmat %*% theta[(3*p+1):(4*p)])))
+}
+```
+
+```{r htfit}
+B1e <- matrix(1, n_e, 1); B2e <- cbind(1, tte)
+
+## texmex on its own defaults (Laplace margins + Keef constraints) is the
+## reference: it sees the already-Laplace pair, so its own marginal step is
+## near-identity and tier 1 isolates the dependence fitter
+init0 <- NULL
+if (has["texmex"]) init0 <- tryCatch({
+  tx <- texmex::mex(data.frame(C = YC, X = YX), mqu = params$tau_star,
+                    dqu = params$kappa, which = "C")
+  co <- tx$dependence$coefficients
+  c(qlogis(min(max((co[1, 1] + 1) / 2, 1e-3), 1 - 1e-3)), co[2, 1], 0, 0)
+}, error = function(e) NULL)
+
+h0 <- fit_ht_basis(yCe, yXe, B1e, init = init0)
+h1 <- fit_ht_basis(yCe, yXe, B2e, init = as.vector(rbind(h0$par, 0)),
+                   Bchk = cbind(1, tdec))
+LRT_dep <- 2 * (h0$value - h1$value)   # 4 df, working likelihood: guide only
+
+lam_grid_dep <- 10^(0:6)
+Bchk_dep <- predict(Bdep, tdec)
+cv_dep <- sapply(lam_grid_dep, function(lam) {
+  mean(sapply(sort(unique(fe)), function(k) {
+    tr <- fe != k
+    f <- fit_ht_basis(yCe[tr], yXe[tr], Bde[tr, , drop = FALSE], lam,
+                      Bchk = Bchk_dep)
+    ht_nll(f$par, yCe[!tr], yXe[!tr], Bde[!tr, , drop = FALSE], 0,
+           Bchk = Bchk_dep) / sum(!tr)
+  }))
+})
+lam_dep <- lam_grid_dep[which.min(cv_dep)]
+hs <- fit_ht_basis(yCe, yXe, Bde, lam_dep,
+        init = c(rep(h0$par[1], p_dep), rep(h0$par[2], p_dep),
+                 rep(h0$par[3], p_dep), rep(h0$par[4], p_dep)),
+        Bchk = Bchk_dep)
+
+## model selection, printed: the spline is kept only if it beats the line
+## at its own game (a worse penalized fit = collapse or the a-m ridge)
+spline_ok <- hs$value < h1$value
+sel <- if (spline_ok) list(par = hs$par, B = Bdep, label = "spline") else
+                      list(par = h1$par, B = cbind(1, tt), label = "linear")
+cs_sel <- curves_of(sel$par, sel$B)
+cat("selected dependence model:", sel$label, "\n")
+
+knitr::kable(data.frame(
+  model = c("all constant", "all linear", "spline (penalized)"),
+  working_nll = round(c(h0$value, h1$value, hs$value), 1),
+  note = c(sprintf("a = %.3f, b = %.3f%s", 2 * plogis(h0$par[1]) - 1,
+                   h0$par[2], ifelse(is.null(init0), "", " (texmex-seeded)")),
+           sprintf("LRT(4df) = %.2f -- approximate guide; the bootstrap
+                    interval is the honest test (v8 Sec 4.6, p. 10)", LRT_dep),
+           sprintf("lambda_dep = %g by blocked CV; %s", lam_dep,
+                   ifelse(spline_ok, "kept", "rejected (collapse) -- linear
+                   selected for all downstream output")))),
+  caption = "Dependence stage, Case 4 (BRIDG | NTHMB), v8 Sec 5 eq. (8)
+  p. 11, Laplace scale, Keef constraints active.")
+```
+
+## Dependence by season, and the freshet-only refit
+
+```{r seasondep}
+sdep <- do.call(rbind, lapply(c("DJF", "MAM", "JJA", "SON"), function(sn) {
+  k <- keep & seas == sn
+  f <- fit_ht_basis(YC[k], YX[k], matrix(1, sum(k), 1))
+  data.frame(season = sn, n = sum(k),
+             a_hat = round(2 * plogis(f$par[1]) - 1, 3),
+             b_hat = round(f$par[2], 3))
+}))
+knitr::kable(sdep, row.names = FALSE, caption = "Constant HT fit per season
+of the conditioning day. A high-freshet / low-winter pattern says a flat
+pooled a(t) is dilution by the season-relative conditioning event -- the
+seasonal threshold makes 'NTHMB extreme' include winter days whose
+co-movement with BRIDG is weak -- not absence of dependence.")
+
+kF <- keep & months %in% 5:8
+h0F <- fit_ht_basis(YC[kF], YX[kF], matrix(1, sum(kF), 1))
+h1F <- fit_ht_basis(YC[kF], YX[kF], cbind(1, tt[kF]),
+                    init = as.vector(rbind(h0F$par, 0)), Bchk = cbind(1, tdec))
+cat(sprintf("freshet-only (May-Aug, n = %d): constant a = %.3f, b = %.3f |
+  linear LRT(4df) = %.2f, a(t) endpoints %.3f -> %.3f\n",
+  sum(kF), 2 * plogis(h0F$par[1]) - 1, h0F$par[2],
+  2 * (h0F$value - h1F$value),
+  2 * plogis(h1F$par[1]) - 1, 2 * plogis(h1F$par[1] + h1F$par[2]) - 1))
+```
+
+## The constraint-off sanity refit
+
+```{r keeffree}
+keef_on <- FALSE
+h1_free <- fit_ht_basis(yCe, yXe, B2e, init = as.vector(rbind(h0$par, 0)))
+keef_on <- TRUE
+cat(sprintf("linear fit, Keef wall OFF: nll %.1f (constrained %.1f) |
+  a(t) endpoints %.3f -> %.3f (constrained: %.3f -> %.3f)\n",
+  h1_free$value, h1$value,
+  2 * plogis(h1_free$par[1]) - 1,
+  2 * plogis(h1_free$par[1] + h1_free$par[2]) - 1,
+  2 * plogis(h1$par[1]) - 1, 2 * plogis(h1$par[1] + h1$par[2]) - 1))
+```
+
+If the free fit lands on the same objective and the same endpoints, the
+zero slope is genuine; if it finds a lower objective and a real slope, the
+constraint's hard 1e10 wall stalled BFGS (the KNOWN DEFECT of the Aug-22
+run: 2698.6 vs 2022.2, endpoints 0.095/0.095 vs 0.396/0.490). The repair --
+smooth penalty in place of the wall, Nelder-Mead then BFGS, multiple starts
+-- is fix-list item 1 in walkthrough_v4.
+
+## Tier 1: texmex on its defaults (all-constant case)
+
+```{r tier1, eval=has[["texmex"]] && exists("tx")}
+co <- tx$dependence$coefficients
+knitr::kable(data.frame(
+  parameter = c("a", "b"),
+  project = round(c(2 * plogis(h0$par[1]) - 1, h0$par[2]), 4),
+  texmex = round(co[1:2, 1], 4)),
+  caption = "Tier 1: all-constant project fit vs texmex on its own defaults
+  (Laplace margins, Keef constraints -- the reference implementation, v8
+  Sec 4.5 p. 10), both on the SAME Laplace-scale pair so the margins are
+  shared and the gap isolates the fitter. The gap should be small; a large
+  one is a fitter problem to investigate, not to explain away. (The Keef
+  implementations differ in detail: texmex imposes Theorem 1 exactly, the
+  project fitter checks the ordering at the residual range endpoints.)")
+```
+
+## Tier 2: the mgcv check (fixed $b$, linear curves)
+
+With $b$ frozen at $\hat b$ and the remaining curves linear, the model is a
+varying-coefficient Gaussian location-scale model --- mean $= a(t)y +
+m(t)y^{b}$, log sd $= \log s(t) + b \log y$ --- which `mgcv::gam(gaulss)`
+fits by ML. Same model, two optimizers; the fitted means must agree. To
+keep it literally the same model, the check fitter uses an identity link
+for $a(t)$ (mgcv's varying coefficient is linear in $t$); the production
+fitter's bounded link and Keef constraint are deliberately not part of
+what this tier tests.
+
+```{r tier2, eval=has[["mgcv"]]}
+b0 <- h0$par[2]
+## identity link for a(t) HERE ONLY: tier 2 is same-model-two-optimizers,
+## and mgcv's varying coefficient is linear in t, so the check model must
+## be too -- the production fitter's bounded link is not what is tested
+ht_nll_fixedb <- function(th, yC, yX, ttv, b0) {
+  a <- th[1] + th[2] * ttv
+  m <- th[3] + th[4] * ttv; s <- exp(th[5] + th[6] * ttv)
+  loc <- a * yC + m * yC^b0; sc <- s * yC^b0
+  sum(log(sc) + 0.5 * ((yX - loc) / sc)^2)
+}
+thf <- optim(c(2 * plogis(h0$par[1]) - 1, 0, h0$par[3], 0, h0$par[4], 0),
+             ht_nll_fixedb, yC = yCe, yX = yXe, ttv = tte, b0 = b0,
+             method = "BFGS", control = list(maxit = 2000))
+a_f <- thf$par[1] + thf$par[2] * tte
+loc_own <- a_f * yCe + (thf$par[3] + thf$par[4] * tte) * yCe^b0
+sc_own  <- exp(thf$par[5] + thf$par[6] * tte) * yCe^b0
+
+yCb <- yCe^b0
+gmfit <- mgcv::gam(list(yXe ~ -1 + yCe + I(tte * yCe) + yCb + I(tte * yCb),
+                        ~ tte + offset(b0 * log(yCe))),
+                   family = mgcv::gaulss())
+lp <- predict(gmfit)
+loc_m <- lp[, 1]
+sd_a <- exp(lp[, 2]); sd_b <- 1 / (exp(lp[, 2]) + 0.01)
+pick <- which.min(abs(c(sd((yXe - loc_m) / sd_a),
+                        sd((yXe - loc_m) / sd_b)) - 1))
+sc_m <- if (pick == 1) sd_a else sd_b
+
+t2 <- c(loc_rel = max(abs(loc_own - loc_m)) / diff(range(yXe)),
+        sc_rel = median(abs(sc_own - sc_m) / sc_own))
+stopifnot(t2["loc_rel"] < 0.02)
+knitr::kable(data.frame(check = c("conditional mean (max gap, range units)",
+                                  "conditional sd (median relative gap)"),
+                        value = signif(t2, 3)),
+             caption = "Tier 2: project fitter (b fixed, linear curves,
+             unconstrained) vs mgcv::gam(gaulss) on the identical model.
+             Mean structure asserted at 2%; sd reported (link-convention
+             sensitive). Note the mgcv fit carries no Keef constraint, so
+             the project fitter runs this case unconstrained too -- the
+             comparison is only clean like for like.")
+```
+
+Note for the tier-2 chunk: the fixed-$b$ comparison model is fitted without
+the Keef check (mgcv cannot impose it), so if the main fit sat on the
+constraint boundary the two would legitimately differ --- the printed
+constant fit's distance from the boundary says whether that caveat bites.
+
+## Diagnostics and the anchor (v8 \S5, pp. 11--12)
+
+```{r htdiag, fig.height=4.2}
+a_e <- if (sel$label == "spline") curves_of(sel$par, Bde) else
+       curves_of(sel$par, cbind(1, tte))
+Zhat <- ((yXe - a_e$a * yCe) / yCe^a_e$b - a_e$m) / a_e$s
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+plot(yCe, Zhat, pch = 16, cex = 0.4, col = adjustcolor("steelblue4", 0.5),
+     xlab = expression(Y[C]), ylab = expression(hat(Z)),
+     main = "residual vs conditioning value")
+lines(lowess(yCe, Zhat, f = 0.5), col = "firebrick3", lwd = 2)
+era_e <- cut(ye, seq(min(years), max(years) + 20, by = 20), right = FALSE)
+boxplot(Zhat ~ era_e, col = "grey92", las = 2, cex.axis = 0.7,
+        xlab = "", ylab = expression(hat(Z)),
+        main = "residual by era (covariate-free G, v8 Sec 5 p. 11)")
+abline(h = 0, lty = 3, col = "grey60")
+par(op)
+Ztable <- Zhat
+```
+
+**Reading the figure.** Left: x-axis the conditioning value $Y_C$ (Laplace
+scale, above $v$), y-axis the standardized residual from the *selected*
+model; the red line is a running mean. Flat at zero with constant scatter
+says the fitted curves absorbed everything systematic; drift in level or
+spread says the normalization failed (v8 \S5, p. 11). Right: the residuals
+by era --- equal boxes are the covariate-free-$G$ assumption, the licence
+for reusing any era's residual at any other $t$ (v8 \S5, p. 12).
+
+```{r anchor}
+mA_C <- fit_ladder_cached(get_series(A_C, "sf"), "AC"); gA_C <- fit_gp_stage(get_series(A_C, "sf"), mA_C)
+mA_X <- fit_ladder_cached(get_series(A_X, "sf"), "AX"); gA_X <- fit_gp_stage(get_series(A_X, "sf"), mA_X)
+YA_C <- qlap(F_of(get_series(A_C, "sf"), mA_C, gA_C))
+YA_X <- qlap(F_of(get_series(A_X, "sf"), mA_X, gA_X))
+ka <- YA_C > v_dep
+h_anchor <- fit_ht_basis(YA_C[ka], YA_X[ka], matrix(1, sum(ka), 1))
+cat(sprintf("Case 1 anchor: a-hat = %.3f (must sit near 1; v8 Sec 5 p. 12),
+            b-hat = %.3f\n", 2 * plogis(h_anchor$par[1]) - 1, h_anchor$par[2]))
+```
+
+# The conditional-simulation display (meeting 62, rebuilt)
+
+Two decisions from the meeting shape this section. *Condition on the day of
+year*: a randomly picked date lands in low-flow seasons and the simulated
+points come out smaller than the real extremes; the display day is now the
+climatological freshet peak (the day of year at which the fitted threshold
+is highest), a parameter of this chunk. *No year colours on the standard
+scale*: after the marginal transform every day is the same Laplace
+distribution, so the standard-margins panel shows one model cloud against
+the data; the year contrast appears only on the original scale, where the
+margins genuinely differ by year --- and the scenario contrast (RCP 4.5
+against 8.5) takes over as the headline comparison once the 8.5 export
+joins the file. Which scale the paper's version uses is the open display
+question for Friday; both are drawn here.
+
+```{r pseudolap, fig.height=5.2}
+## reverse direction fitted with the same machinery (v8 Sec 5, p. 11)
+keepR <- YX > v_dep
+hR <- fit_ht_basis(YX[keepR], YC[keepR], cbind(1, tt[keepR]),
+                   Bchk = cbind(1, tdec))
+csR <- curves_of(hR$par, cbind(1, tt[keepR]))
+ZtabR <- ((YC[keepR] - csR$a * YX[keepR]) / YX[keepR]^csR$b - csR$m) / csR$s
+
+doy_star <- as.integer(names(which.max(tapply(mX$U[, K], doy, mean))))
+Yr_mid <- round(mean(range(years)))
+cat("display day of year (freshet peak):", doy_star,
+    "| standard-scale reference year:", Yr_mid, "\n")
+
+gen_pseudo <- function(a, b, m, s, Ztab, n = 600) {
+  yc <- qlap(params$kappa + (1 - params$kappa) * runif(n))
+  z <- sample(Ztab, n, replace = TRUE)
+  cbind(yc = yc, yx = a * yc + yc^b * (m + s * z))
+}
+at_day <- function(cv, Yr) {          # selected-model curves on one day
+  i <- which(years == Yr & doy == doy_star)[1]
+  if (is.na(i)) i <- which(years == Yr & doy == doy_star - 1)[1]
+  list(a = cv$a[i], b = cv$b[i], m = cv$m[i], s = cv$s[i], idx = i)
+}
+cs_full <- curves_of(sel$par, if (sel$label == "spline") Bdep else cbind(1, tt))
+csR_full <- curves_of(hR$par, cbind(1, tt))
+
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+pd <- at_day(cs_full, Yr_mid)
+plot(YC, YX, pch = ".", col = "grey35",
+     xlab = "Y (NTHMB, Laplace)", ylab = "Y (BRIDG, Laplace)",
+     main = sprintf("(a) model pseudosample of (Y_C, Y_X), year %d", Yr_mid),
+     cex.main = 0.9)
+abline(v = v_dep, lty = 2, col = "grey55")
+ps <- gen_pseudo(pd$a, pd$b, pd$m, pd$s, Ztable)
+points(ps[, 1], ps[, 2], cex = 0.45, col = adjustcolor("steelblue3", 0.6))
+legend("topleft", c("model pseudosample", "data"),
+       col = c("steelblue3", "grey35"), pch = c(1, 46), bty = "n", cex = 0.8)
+pdR <- at_day(csR_full, Yr_mid)
+plot(YX, YC, pch = ".", col = "grey35",
+     xlab = "Y (BRIDG, Laplace)", ylab = "Y (NTHMB, Laplace)",
+     main = sprintf("(b) reverse direction, year %d", Yr_mid),
+     cex.main = 0.9)
+abline(v = v_dep, lty = 2, col = "grey55")
+psR <- gen_pseudo(pdR$a, pdR$b, pdR$m, pdR$s, ZtabR)
+points(psR[, 1], psR[, 2], cex = 0.45, col = adjustcolor("steelblue3", 0.6))
+par(op)
+```
+
+**Reading the figure.** Both axes are Laplace-scale values; panel (a)
+conditions on NTHMB (x-axis), panel (b) on BRIDG. Dots are all observed
+days; the dashed line is the dependence threshold $v$; circles are the
+model's pseudosample to the right of $v$, generated at the freshet-peak day
+of the mid-axis year. The eye's goodness-of-fit test: circles living where
+dots live is agreement; circles beyond the largest dots are the
+extrapolation, shown rather than asserted. One colour only: on this scale
+the margins carry no year, so a year contrast here would draw a
+distinction the axes cannot show (the joint drift is real but lives in the
+dependence curves; it is quantified by the fitted $a(t)$ and the
+functionals below, and displayed on the original scale next). Comparing
+panels (a) and (b) is the self-consistency caution (v8 \S5, p. 11).
+
+```{r pseudoorig, fig.height=5}
+q_inv <- function(p, ladder, gp, idx) {
+  U <- ladder$U[idx, ]; sig <- gp$sig[idx]; xi <- gp$xi
+  beta1 <- (U[2] - U[1]) / log(taus[2] / taus[1])
+  sapply(p, function(pp) {
+    if (pp >= params$tau_star)
+      U[K] + sig / xi * (((1 - params$tau_star) / (1 - pp))^xi - 1)
+    else if (pp < taus[1]) U[1] + beta1 * log(pp / taus[1])
+    else {
+      k <- max(which(taus <= pp))
+      if (k == K) U[k]
+      else U[k] + (U[k + 1] - U[k]) * (pp - taus[k]) / (taus[k + 1] - taus[k])
+    }
+  })
+}
+yr_show <- c(params$start_year + 6, max(years) - 4)
+cols2 <- c("steelblue3", "firebrick3")
+plot(xC, xX, pch = ".", col = "grey80", log = "xy",
+     xlab = "NTHMB daily flow", ylab = "BRIDG daily flow",
+     main = sprintf("model pseudosamples on the original scale, day-of-year
+     %d, years %d and %d", doy_star, yr_show[1], yr_show[2]), cex.main = 0.9)
+for (e in 1:2) {
+  pdE <- at_day(cs_full, yr_show[e])
+  ps <- gen_pseudo(pdE$a, pdE$b, pdE$m, pdE$s, Ztable)
+  xc_o <- q_inv(pmin(plap(ps[, 1]), 1 - 1e-9), mC, gC, pdE$idx)
+  xx_o <- q_inv(pmin(pmax(plap(ps[, 2]), 1 / (4 * N)), 1 - 1e-9), mX, gX, pdE$idx)
+  points(xc_o, xx_o, cex = 0.45, col = adjustcolor(cols2[e], 0.55))
+}
+amx <- tapply(seq_len(N), years, function(i) i[which.max(xC[i])])
+points(xC[amx], xX[amx], pch = 17, cex = 0.7, col = "grey25")
+legend("topleft", c(paste("pseudo", yr_show[1]), paste("pseudo", yr_show[2]),
+                    "annual-max days (NTHMB)", "all days"),
+       col = c(cols2, "grey25", "grey80"), pch = c(1, 1, 17, 46),
+       bty = "n", cex = 0.8)
+```
+
+**Reading the figure.** The same pseudosamples pushed back through each
+day's fitted margins onto the original flow scale (log axes), generated at
+the freshet-peak day of an early and a late year --- here the year contrast
+is meaningful, because the margins differ by year on this scale. The dark
+triangles are the observed annual-maximum days of the conditioning station:
+the meeting's complaint --- simulated points smaller than the real extremes
+--- is the check here; with day-of-year conditioning the clouds must reach
+and extend the triangles' territory. The blue-to-red movement is the whole
+fitted change --- margins and dependence together; whether the paper shows
+this original-scale version or the standard-scale one is the Friday
+question, and the scenario contrast will replace the year contrast once
+RCP 8.5 is in the file.
+
+# Stage 3: extremal index (v8 \S6, eq. 13, p. 15)
+
+```{r theta}
+ferro_segers <- function(exc_idx) {
+  Ti <- diff(exc_idx); n <- length(exc_idx)
+  if (max(Ti) <= 2) min(1, 2 * sum(Ti)^2 / ((n - 1) * sum(Ti^2)))
+  else min(1, 2 * sum(Ti - 1)^2 / ((n - 1) * sum((Ti - 1) * (Ti - 2))))
+}
+theta_route <- function(x, u) {
+  own <- ferro_segers(which(x > u))
+  if (has["extRemes"]) {
+    pkg <- tryCatch(as.numeric(
+      extRemes::extremalindex(x - u, threshold = 0, method = "intervals")[1]),
+      error = function(e) NA)
+    if (!is.na(pkg)) {
+      cat(sprintf("theta: extRemes %.3f | project %.3f (consistency)\n",
+                  pkg, own))
+      return(pkg)
+    }
+  }
+  own
+}
+thC <- theta_route(xC, mC$U[, K])
+thX <- theta_route(xX, mX$U[, K])
+cat(sprintf("theta: NTHMB %.3f (mean run %.1f d), BRIDG %.3f (%.1f d)\n",
+            thC, 1 / thC, thX, 1 / thX))
+```
+
+# Stage 4: return levels (v8 \S6, eqs. 10--13, pp. 14--15)
+
+```{r rl}
+rl_root <- function(Yr, Ts, U, sig, xi, theta) {
+  idx <- which(years == Yr)
+  u <- U[idx, K]; s <- sig[idx]
+  logPr <- function(x, th) {
+    z <- pmax(1 + xi * (x - u) / s, 0)
+    p <- (1 - params$tau_star) * ifelse(x > u, z^(-1 / xi), 1)
+    th * sum(log(pmax(1 - p, 1e-12)))
+  }
+  sapply(Ts, function(T)
+    tryCatch(uniroot(function(x) logPr(x, theta) - log(1 - 1 / T),
+                     c(max(u) * 1.0001, max(u) + 80 * max(s)))$root,
+             error = function(e) NA))
+}
+Ygrid <- seq(min(years) + 2, max(years) - 2, by = 5)
+Ts <- c(10, 50, 100)
+rlC <- t(sapply(Ygrid, rl_root, Ts = Ts, U = mC$U, sig = gC$sig,
+                xi = gC$xi, theta = thC))
+rlX <- t(sapply(Ygrid, rl_root, Ts = Ts, U = mX$U, sig = gX$sig,
+                xi = gX$xi, theta = thX))
+
+## Route A vs Route B at theta = 1: the machinery check (v8 Sec 6, p. 15)
+Yr0 <- Ygrid[which.min(abs(Ygrid - median(Ygrid)))]
+idx0 <- which(years == Yr0)
+u0 <- mX$U[idx0, K]; s0 <- gX$sig[idx0]
+n_sim <- 4000
+sim_max <- replicate(n_sim, {
+  exc <- runif(length(idx0)) < (1 - params$tau_star)
+  if (!any(exc)) return(max(u0))
+  ex <- which(exc)
+  max(u0[ex] + s0[ex] / gX$xi * (runif(length(ex))^(-gX$xi) - 1))
+})
+routeA_1 <- rl_root(Yr0, Ts, mX$U, gX$sig, gX$xi, theta = 1)
+routeB_1 <- quantile(sim_max, 1 - 1 / Ts)
+knitr::kable(data.frame(T = Ts, routeA = round(routeA_1, 1),
+                        routeB = round(routeB_1, 1),
+                        rel_gap = signif(abs(routeA_1 - routeB_1) / routeA_1, 2)),
+             caption = sprintf("Route A vs Route B at theta = 1, year %d,
+             BRIDG (%d simulated years). Small gaps validate the chaining
+             machinery before the theta correction is trusted.", Yr0, n_sim))
+
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+cols <- c("grey55", "steelblue3", "firebrick3")
+for (nm in list(list(rlC, "NTHMB"), list(rlX, "BRIDG"))) {
+  matplot(Ygrid, nm[[1]], type = "l", lty = 1, lwd = 2, col = cols,
+          xlab = "reference year", ylab = "flow",
+          main = paste0(nm[[2]], ": x_T(Y), theta-corrected"))
+  legend("topleft", paste0("T = ", Ts), col = cols, lwd = 2, bty = "n",
+         cex = 0.85)
+}
+par(op)
+```
+
+**Reading the figure.** The x-axis is the reference year $Y$; the y-axis
+the flow level $x_T(Y)$ a year with year-$Y$'s climate exceeds with
+probability $1/T$ (v8 eq. 10, p. 14 --- a probability statement about a
+reference year, not a forecast). One curve per return period, corrected by
+$\theta$ for clustering (v8 eq. 13, p. 15). Rising = intensification;
+falling is physically possible on snowmelt rivers; the horizontal reading
+--- the level that was a 100-year event early becoming a 50-year event
+late --- is the paper's most quotable sentence, once the bootstrap bands
+of the uncertainty section are around the curves.
+
+# Stage 5: the three conditional functionals (v8 \S6, eq. 14, p. 16)
+
+The professor's three summaries, read off one generated cloud per reference
+year, all at the display day of year: the conditional mean, the conditional
+quantiles, and the band probability --- demonstrated twice: $P_{co}$
+(BRIDG above its own day's $u(t;\tau^{*})$ while NTHMB is extreme) and
+$P_{band}$ (bounds at the day's marginal `r params$band_lo` and
+`r params$band_hi` quantiles). Bounds and conditioning level are YAML
+parameters. On the Laplace scale the band bounds are flat numbers, so the
+probabilities need no margin inversion; the mean does, through the day's
+$F^{-1}$.
+
+```{r condsummaries}
+cond_summaries <- function(level, tgrid_yr, cv_full, Ztab, ladderX, gpX) {
+  y_lo <- qlap(params$band_lo); y_hi <- qlap(params$band_hi)
+  t(sapply(tgrid_yr, function(Yr) {
+    pdE <- at_day(cv_full, Yr)
+    yc <- qlap(level + (1 - level) * runif(params$n_mc))
+    z <- sample(Ztab, params$n_mc, replace = TRUE)
+    yx <- pdE$a * yc + yc^pdE$b * (pdE$m + pdE$s * z)
+    px <- pmin(pmax(plap(yx), 1 / (4 * N)), 1 - 1e-9)
+    flows <- q_inv(px, ladderX, gpX, pdE$idx)
+    c(mean = mean(flows),
+      q05 = unname(quantile(flows, 0.05)),
+      q50 = unname(quantile(flows, 0.50)),
+      q95 = unname(quantile(flows, 0.95)),
+      P_co = mean(yx > y_star),
+      P_band = mean(yx >= y_lo & yx <= y_hi))
+  }))
+}
+csum <- cond_summaries(params$cond_level, Ygrid, cs_full, Ztable, mX, gX)
+
+op <- par(mfrow = c(1, 2), mar = c(3.5, 3.5, 2.5, 1), mgp = c(2.2, 0.7, 0))
+plot(Ygrid, csum[, "mean"], type = "l", lwd = 2, col = "steelblue4",
+     ylim = range(csum[, c("q05", "q95")]), xlab = "reference year",
+     ylab = "BRIDG flow",
+     main = sprintf("E and quantiles of BRIDG | NTHMB at %.2f, doy %d",
+                    params$cond_level, doy_star), cex.main = 0.9)
+polygon(c(Ygrid, rev(Ygrid)), c(csum[, "q05"], rev(csum[, "q95"])),
+        col = adjustcolor("steelblue4", 0.18), border = NA)
+lines(Ygrid, csum[, "mean"], lwd = 2, col = "steelblue4")
+lines(Ygrid, csum[, "q50"], lwd = 1.5, lty = 2, col = "steelblue4")
+legend("topleft", c("mean", "median", "5-95% band"), bty = "n", cex = 0.8,
+       col = "steelblue4", lty = c(1, 2, NA), lwd = c(2, 1.5, NA),
+       fill = c(NA, NA, adjustcolor("steelblue4", 0.18)),
+       border = c(NA, NA, NA))
+plot(Ygrid, csum[, "P_co"], type = "b", pch = 16, lwd = 2,
+     col = "firebrick3", ylim = c(0, max(csum[, "P_co"]) * 1.15),
+     xlab = "reference year", ylab = "probability",
+     main = "P_co: BRIDG above its own threshold | NTHMB extreme",
+     cex.main = 0.9)
+lines(Ygrid, csum[, "P_band"], type = "b", pch = 17, lwd = 2,
+      col = "darkorange3")
+legend("topleft", c("P_co", sprintf("P_band (%.3g-%.3g)", params$band_lo,
+                                    params$band_hi)),
+       col = c("firebrick3", "darkorange3"), pch = c(16, 17), lwd = 2,
+       bty = "n", cex = 0.8)
+par(op)
+
+yr3 <- Ygrid[c(1, ceiling(length(Ygrid) / 2), length(Ygrid))]
+knitr::kable(round(csum[Ygrid %in% yr3, ], 3),
+             caption = sprintf("The three-year table (years %s, doy %d):
+             the three functionals at conditioning level %.2f.",
+             paste(yr3, collapse = ", "), doy_star, params$cond_level))
+```
+
+**Reading the figure and the table.** Left: x-axis reference year, y-axis
+BRIDG flow. The solid line is the conditional mean given NTHMB extreme at
+the stated level *on the freshet-peak day* --- the day-of-year conditioning
+the meeting required, so these are peak-season answers, comparable with
+real annual extremes; the dashed line is the conditional median; the band
+spans the conditional 5--95\% quantiles. Right: $P_{co}$ (red) is the
+co-exceedance probability --- BRIDG above its own extreme threshold while
+NTHMB is extreme; $P_{band}$ (orange) the chance BRIDG lands between its
+day's marginal `r params$band_lo` and `r params$band_hi` quantiles on those
+days. Both rising along the axis is co-flooding intensifying even where
+marginal extremes weaken. The table is the same three functionals at the
+axis start, middle and end --- the tabular form of "how much worse."
+
+## The HT04 Table-5 discipline: model vs empirical, where the data can check
+
+```{r table5}
+eras2 <- list(early = min(years):(min(years) + 29),
+              late = (max(years) - 29):max(years))
+t5 <- do.call(rbind, lapply(names(eras2), function(en) {
+  yrs_e <- eras2[[en]]
+  emp_days <- which(keep & years %in% yrs_e)
+  emp <- mean(xX[emp_days])
+  ## generate at the OBSERVED exceedance days of the era (their own year
+  ## and day of year), so the comparison is day-matched, not day-averaged
+  gen_days <- sample(emp_days, params$n_mc, replace = TRUE)
+  yc <- qlap(params$kappa + (1 - params$kappa) * runif(params$n_mc))
+  z <- sample(Ztable, params$n_mc, replace = TRUE)
+  a_d <- cs_full$a[gen_days]; b_d <- cs_full$b[gen_days]
+  m_d <- cs_full$m[gen_days]; s_d <- cs_full$s[gen_days]
+  yx <- a_d * yc + yc^b_d * (m_d + s_d * z)
+  px <- pmin(pmax(plap(yx), 1 / (4 * N)), 1 - 1e-9)
+  gen <- mean(sapply(seq_len(params$n_mc), function(i)
+    q_inv(px[i], mX, gX, gen_days[i])))
+  data.frame(era = en, empirical = round(emp, 1), model = round(gen, 1),
+             rel_gap = round(abs(emp - gen) / emp, 3))
+}))
+knitr::kable(t5, row.names = FALSE,
+             caption = "Model vs empirical conditional mean of BRIDG flow
+             given NTHMB above the dependence threshold, per era, generated
+             at the observed exceedance days themselves (day-matched).
+             Agreement here is the licence for the higher-level
+             extrapolations above (HT04 Table 5 discipline).")
+```
+
+# Uncertainty: the block bootstrap (v8 \S6, p. 15)
+
+```{r boot}
+boot_once <- function() {
+  yrs <- unique(years)
+  keep_y <- years %in% sample(yrs, replace = TRUE)
+  gX_b <- pen_rq_seas(xX[keep_y], Xseas[keep_y, ], params$tau_star,
+                      ifelse(is.na(mX$lam_u), 100, mX$lam_u))
+  uX_b <- as.vector(Xseas %*% gX_b)
+  e <- xX > uX_b & keep_y
+  gpX_b <- fit_gp_basis((xX - uX_b)[e], Xseas[e, , drop = FALSE],
+                        gX$lam_s, Dtr)
+  th_b <- ferro_segers(which(xX > uX_b))
+  kb <- YC > v_dep & keep_y
+  hb <- fit_ht_basis(YC[kb], YX[kb], cbind(1, tt[kb]),
+                     Bchk = cbind(1, tdec))
+  sigX_b <- exp(as.vector(Xseas %*% gpX_b$gam))
+  U_b <- mX$U; U_b[, K] <- uX_b
+  list(rl100 = sapply(Ygrid, function(Yr)
+         rl_root(Yr, 100, U = U_b, sig = sigX_b, xi = gpX_b$xi,
+                 theta = th_b)),
+       a_ends = 2 * plogis(hb$par[1] + hb$par[2] * c(0, 1)) - 1)
+}
+boots <- replicate(params$B_boot, boot_once(), simplify = FALSE)
+rl_mat <- sapply(boots, `[[`, "rl100")
+a_mat <- sapply(boots, `[[`, "a_ends")
+bandr <- apply(rl_mat, 1, quantile, c(0.025, 0.975), na.rm = TRUE)
+plot(Ygrid, rlX[, 3], type = "n",
+     ylim = range(bandr, rlX[, 3], na.rm = TRUE),
+     xlab = "reference year", ylab = "flow",
+     main = sprintf("BRIDG: x_100(Y), %d-replicate year-block bootstrap
+     (project fitters inside the loop; selections join at B = 2000)",
+                    params$B_boot))
+polygon(c(Ygrid, rev(Ygrid)), c(bandr[1, ], rev(bandr[2, ])),
+        col = adjustcolor("firebrick3", 0.2), border = NA)
+lines(Ygrid, rlX[, 3], lwd = 2, col = "firebrick3")
+
+a_ci <- apply(a_mat, 1, quantile, c(0.025, 0.975))
+a_lin_ends <- 2 * plogis(h1$par[1] + h1$par[2] * c(0, 1)) - 1
+knitr::kable(data.frame(endpoint = c("axis start", "axis end"),
+  a_hat = round(a_lin_ends, 3),
+  lo = round(a_ci[1, ], 3), hi = round(a_ci[2, ], 3)),
+  caption = "The honest move-one test at the dependence stage (v8 Sec 4.6,
+  p. 10): year-block bootstrap intervals for a(t) at the axis endpoints,
+  Laplace scale.")
+```
+
+**Reading the figure and the table.** The red curve is the production
+100-year level for BRIDG; the band its bootstrap 95\% interval --- years
+resampled with their labels kept, threshold, GP, $\theta$ and the linear
+dependence model refitted per replicate, so the band measures estimation
+uncertainty on the same axis (v8 \S6, p. 15). A band at the late axis that
+excludes the early-axis level is the uncertainty-aware "the risk changed."
+The table gives the bootstrap answer for the dependence trend: the interval
+at the axis end excluding the interval at the start is what certifies the
+working-likelihood LRT's verdict (v8 \S4.6, p. 10). At $B = `r params$B_boot`$
+these are knit-scale indications; the paper-scale run is $B = 2000$ with
+every selection inside the loop.
+
+# The RCP 8.5 arm (v8 \S6, p. 16)
+
+The scenario comparison --- the display contrast the meeting settled on ---
+needs the RCP 8.5 series in the same schema as this file (station, date,
+sf, bf; 1969--2099). Once that export exists, this report's pipeline runs
+on it unchanged (the axis is read from the file), and the
+scenario-contrast versions of the pseudosample display and the functionals
+replace the within-scenario year contrast. Blocked on the data export;
+nothing else here waits on it.
+
+# Standing items, and the Friday list
+
+**Known defect (blocking, Aug-22 run):** the Keef constraint's hard wall
+stalled the BFGS optimiser at the dependence stage -- all model sizes
+returned the identical objective, the trend statistic was exactly 0.00, and
+the constraint-off refit found a far lower objective with a rising a(t). No
+dependence-stage number (including the functionals) is quotable until the
+smooth-penalty repair is in; the full diagnosis, evidence and repair recipe
+are in walkthrough_v4 (same folder), Section "the defect".
+
+Cleaning: the forensics tables above are evidence, not decisions ---
+which values or months to exclude, and how to document it, is decided with
+the professor; 1968 is already out. The three problems (data, threshold,
+excesses + PIT) map to Sections 2, 3 and 4--5. For Friday: confirm the
+identity of "the three problems"; the display scale (standard vs original,
+Section 7 draws both); whether the year contrast on the original-scale
+panel is wanted alongside the scenario contrast; and the seasonal-threshold
+consequence flagged in the preamble --- with margins that bend within the
+year, the dependence stage conditions on season-relative extremes, and that
+reading should be agreed explicitly. Laplace is the working scale
+throughout (v8 \S3); the Gumbel refit remains available as the sensitivity
+appendix v8 \S7 (p. 17) names. Reproducibility: seed 20260818 once at the
+top; knit-scale settings are the YAML parameters.
+
+```{r session}
+sessionInfo()
+```

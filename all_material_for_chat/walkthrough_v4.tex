@@ -1,0 +1,1450 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{parskip}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyvrb}
+\newcommand{\code}[1]{\texttt{#1}}
+\definecolor{warn}{rgb}{0.65,0.10,0.10}
+\definecolor{ok}{rgb}{0.10,0.45,0.15}
+\newcommand{\stopsign}[1]{{\color{warn}\textbf{#1}}}
+\newcommand{\good}[1]{{\color{ok}\textbf{#1}}}
+
+\title{Non-stationary conditional extremes for BC streamflow:\\
+presenting the analysis, and what is inside the code}
+\author{Alex Lin \quad (supervisor: Natalia Nolde)}
+\date{August 2026 \quad (version 4)}
+
+\begin{document}
+\maketitle
+
+\noindent
+This document exists for two jobs. \textbf{Job 1: present the analysis.}
+Part~I walks the report in the order I would show it; for every figure it
+gives the axes, the theory behind the picture (with the derivation where one
+exists), the exact mechanism that produced it, what our own numbers say, and
+the follow-up questions that figure invites, with answers. \textbf{Job 2:
+prove the code is not a black box.} Part~II opens each algorithm: what it
+computes, the pseudocode, why that is the right computation, which part is a
+published package and which part is ours, and how each is verified. Part~III
+is a question-and-answer drill. Part~IV is the fix list.
+
+Pointers of the form ``v8~\S$x$, eq.~($n$), p.~$y$'' give the section,
+equation and page of \emph{my current understanding of the model}, version~8.
+Every number quoted is from the knit of \code{code\_report\_v4.Rmd} on
+\code{daily\_sf\_bf\_rcp45\_only\_1945\_2099\_9avg.csv}: R 4.5.2, qgam 2.0.0,
+evgam 1.0.1, mgcv 1.9-3, texmex 2.4.9, extRemes 2.2-1, quantreg 6.1; axis
+1969-01-01 to 2099-12-31, $n = 47{,}847$ days; conditioning pair BRIDG given
+NTHMB (Case~4), anchor BARRM given BARRS (Case~1).
+
+\tableofcontents
+\newpage
+
+\section{Status: what is ready to show, and what is not}
+
+Read this page before the meeting. The analysis has two halves, and they are
+in different states.
+
+\begin{longtable}{@{}p{4.3cm}p{2.1cm}p{8.2cm}@{}}
+\toprule
+\textbf{Stage} & \textbf{State} & \textbf{Basis} \\
+\midrule
+\endhead
+Data cleaning gate & \good{present} & 0 duplicate rows, 0 missing dates, 0 NA,
+no non-positive baseflow; streamflow effectively tie-free (most repeated value
+occurs twice; 0.0\% of days on values repeated $\ge 10$ times) \\
+Seasonal threshold & \good{present} & Threshold tracks the annual cycle in
+every window; trend slopes significant at all three series ($z = 11.8$, $7.0$,
+$17.7$) \\
+Local 5\% calibration & \good{present, with the upgrade} & Additive design
+misses the first era (SON 0.149, JJA 0.123); the tensor
+\code{te(doy,\,tt)} repairs it (SON 0.039, JJA 0.039) \\
+GP tail & \good{present} & 2236--2299 exceedances per series; scale trend
+significant everywhere ($p<10^{-8}$) \\
+PIT / Laplace gate & \good{present} & Histograms flat to within the noise the
+sample allows (Section~\ref{sec:pit} quantifies ``flat''), sliced QQ on the
+line in both seasons and both decades, no point mass \\
+Extremal index, return levels, machinery checks & \good{present} & extRemes
+$\equiv$ project to three decimals; Route A vs B agree to $\le 1\%$ \\
+\midrule
+\stopsign{Dependence stage} & \stopsign{do not present as a finding} &
+The constrained optimiser did not move off its starting value: all three
+model sizes returned the identical objective 2698.6, the trend test returned
+exactly 0.00, $\hat a(t)$ came out exactly flat. Section~\ref{sec:defect}
+diagnoses it and gives the repair \\
+\stopsign{Conditional functionals} & \stopsign{report as provisional} &
+They are computed from that stuck dependence fit, so the flat
+$P_{co}\approx 0.35$ is a property of the defect, not of the rivers \\
+\bottomrule
+\end{longtable}
+
+\noindent
+The honest sentence for the meeting: \emph{the marginal stage passes every
+check you asked for; the dependence stage has a numerical defect I have
+located and can state precisely, and its results are on hold until it is
+fixed.} That is a stronger position than presenting a number that cannot be
+defended --- and Section~\ref{sec:defect} shows the defect is already
+half-solved, because two independent pieces of evidence agree on what the
+answer should look like.
+
+\section*{Part I --- The walkthrough}
+\addcontentsline{toc}{section}{Part I --- The walkthrough}
+
+\subsection{Station 1: the data gate}
+\label{sec:datagate}
+
+\textbf{What is shown.} Printed counters (duplicates, gaps, missing values,
+non-positive baseflow), then three forensic instruments per series: the ten
+most repeated exact values with the months and years they fall in; runs of
+identical consecutive days; and the audit of days at or near the series
+minimum.
+
+\textbf{Why ties are fatal if present --- the exact mechanism.} The whole
+pipeline stands on the probability integral transform
+(Section~\ref{sec:pitthm}), and that theorem requires a \emph{continuous}
+distribution. Suppose instead some value $x_0$ occurs on many days, so
+$\Pr(X = x_0) = p > 0$. Then the transformed variable $U = F(X)$ inherits an
+atom: a mass of size $p$ sits at the single point $F(x_0)$, no matter how well
+the model fits. On the histogram that is a spike; on the QQ plot it is a flat
+run of identical sample values ending in a jump; on the Laplace scatter it is
+a horizontal or vertical line of points. So the forensics are not tidiness ---
+they are a precondition of the method, and each instrument targets one way
+mass can enter: the repeated-value table finds atoms wherever they occur; the
+run table finds \emph{plateaus} (one value frozen across consecutive days,
+which is an instrument or post-processing signature, since rivers vary daily
+--- and which also inflates serial dependence); the floor audit finds a hard
+minimum (detection limit or frozen gauge), the single most common atom in
+flow data.
+
+\textbf{How each table is computed.} The repeated-value table is a frequency
+count of exact values, keeping the top ten, with each value's day count, year
+range, number of distinct years, and the months it occurs in --- the last two
+columns answer the professor's question ``which values are these, and is it
+only one year or many.'' The run table applies run-length encoding to the
+daily series and keeps every run of $\ge 3$ equal consecutive values with its
+start date, length and value, plus a month table of where runs live. The
+floor audit counts days exactly at the minimum and within 1\% of it.
+
+\textbf{Our numbers.} Streamflow, both stations: the most repeated value
+occurs exactly \emph{twice} in 47{,}847 days; 0.0\% of days sit on values
+repeated ten or more times; zero runs of three identical days; the minimum is
+carried by a single day. Baseflow: 3.0\% of days (1447) carry a value repeated
+$\ge 10$ times --- the repeated values are spread over 10--14 different years
+each and concentrate in low-flow months --- and there are exactly four short
+plateaus (lengths 3, 3, 3, 4; one in February, three in March). File-level:
+0 duplicated (station, date) rows, 0 missing dates, 0 missing values, 0 days
+of $\mathrm{bf} \le 0$.
+
+\textbf{What to say.} ``The cleaning items are closed: no duplicated records,
+no gaps, no missing values, no non-positive baseflow, and the streamflow
+series carry no repeated values and no frozen stretches. The remaining tie
+mass is confined to baseflow --- three percent of days, spread across years,
+in the low-flow range --- which is a precision signature of the baseflow
+product, matters only for Structure~B, and is documented rather than
+hidden.''
+
+\textbf{Question: ``how do you know the winter data are not corrupted?''}
+Three pieces of evidence, all printed: no winter value repeats (streamflow),
+no frozen stretches exist anywhere in streamflow, and the winter window
+figures show the smooth recessions hydrology produces rather than flat
+segments or discrete steps.
+
+\textbf{Question: ``would you exclude the baseflow ties?''} No --- they are
+endemic (every era, not one bad year), so exclusion would delete a property
+of the data source rather than an error. The honest treatments are to note
+the granularity in the paper and, if Structure~B tail diagnostics ever show
+an atom-induced artifact, to jitter within the reported precision as a
+sensitivity check.
+
+\subsection{Station 2: the seasonal moving threshold}
+\label{sec:threshold}
+
+\textbf{What is shown.} Twenty separate panels --- both stations, streamflow
+and baseflow, five randomly drawn two-year windows each. Grey dots: daily
+values. Red: the working threshold $u(t; 0.95)$. Blue: the moving median
+$u(t; 0.5)$. Each title carries that window's own share of days above red.
+
+\textbf{The principle: a threshold is a probability, not a level.} The object
+is the conditional quantile curve defined by
+$\Pr\{X_t \le u(t;\tau)\} = \tau$ \emph{at every date} (v8~\S2.1, eq.~(3),
+p.~3). On a snowmelt river a fixed horizontal level is a once-a-decade event
+in February and a routine event in July, so its exceedances would be ``July
+days,'' not ``extreme days,'' and every downstream stage would inherit that
+confusion. Fixing the probability and letting the level move makes
+``exceedance'' mean the same thing --- rarity $1-\tau$ --- on every date. That
+is Lee and Lee's argument, and the local exceedance checks of
+Station~\ref{sec:local5} verify the property rather than assume it.
+
+\textbf{Why quantile regression finds a quantile --- the derivation.} The
+fitted curve minimises the pinball (check) loss
+$\rho_\tau(r) = \tau r$ for $r \ge 0$ and $(\tau-1) r$ for $r < 0$, applied to
+residuals $r = x - u$. Differentiate the expected loss in $u$:
+\[
+\frac{d}{du}\,\mathbb{E}\,\rho_\tau(X-u)
+= -\tau \Pr(X > u) + (1-\tau)\Pr(X < u)
+= F(u) - \tau ,
+\]
+which is zero exactly when $F(u) = \tau$. So minimising the pinball loss
+\emph{is} estimating the $\tau$-quantile --- not a heuristic, an identity.
+Everything else (splines, penalties, qgam) is machinery for letting $u$
+depend on $t$ smoothly while this identity does the statistical work.
+
+\textbf{What the curve is made of.} Two components in one formula
+(v8~\S4.1--4.2, pp.~5--7). A \emph{cyclic} day-of-year spline
+(\code{bs = "cc"}): basis functions periodic with period one year, built so
+the curve and its derivatives match across the 31~December / 1~January join
+--- one seasonal shape, learned from all 131 years at once. Plus a slow
+\emph{trend} spline in the running date: cubic bumps with knots spread over
+the century, each coefficient shaped by the several years under its own bump.
+The tensor upgrade of Station~\ref{sec:local5} replaces ``seasonal shape
+$+$ trend'' by a smooth \emph{surface} in (day-of-year, year), letting the
+shape itself evolve.
+
+\textbf{Why not fit each calendar day separately.} Day-of-year alone has 366
+covariate values and deletes the year --- June~14 of 1970 and of 2095 would be
+forced to share one distribution, and change over the record (the object of
+study) could not appear. The running axis keeps the year but has no repeats;
+smoothness is what converts neighbouring days into information about a given
+date. The two-component basis takes the best of both: repetition across years
+for the cycle, neighbours along the axis for the trend.
+
+\textbf{The trend test behind the slope numbers (move one).} The pinball loss
+is a loss, not a likelihood, so there is no likelihood-ratio test here.
+Instead: fit the rung with a linear trend term (harmonics included in
+\emph{both} candidates, so the slope is trend, not season), then resample
+whole years with replacement 30 times, refit, and use the spread of the 30
+slopes as the standard error. Whole years, because flood days cluster ---
+resampling days would understate the error. Our numbers: NTHMB slope $61.8$,
+SE $5.2$, $z = 11.8$; BRIDG $7.12/1.02$, $z=7.0$; BRIDG baseflow
+$1.77/0.10$, $z = 17.7$. All three high quantiles are rising, decisively.
+
+\textbf{What to say.} ``The threshold tracks the seasonal cycle within each
+year --- these are the one-to-two-year windows you asked for --- and each
+window's own exceedance share is printed in its title. The trend in the high
+quantile is significant at every series.''
+
+\textbf{Question: ``what should the share in a title be?''} 0.05, with room
+for noise: a two-year window holds about 730 days, so even independent days
+give a standard deviation of $\sqrt{0.05 \times 0.95 / 730} \approx 0.008$,
+and clustering roughly doubles it --- so anything in about $0.03$--$0.07$ is
+consistent with perfect calibration, and a title far outside that range
+localises a miscalibrated stretch.
+
+\subsection{Station 3: the local 5\% table --- and why the tensor design wins}
+\label{sec:local5}
+
+\textbf{What is shown.} The share of days above $u(t;0.95)$ by season (rows)
+and 22-year era (columns) --- 24 cells, target 0.05 in each --- under the
+additive threshold; then the same table under the tensor threshold.
+
+\textbf{Why this is the decisive check.} Pooled calibration is guaranteed
+almost by construction (a quantile fit places 5\% of \emph{all} days above
+itself); the professor's demand was ``roughly 5\% \emph{locally}, not just
+overall,'' i.e.\ that the table be flat. And the check is \emph{out of
+model}: no fitting criterion optimises these cells, so improvement in them is
+evidence, not bookkeeping.
+
+\textbf{How much a cell may wobble.} A cell holds roughly
+$22 \times 90 \approx 2000$ days. Independent days would give the share a
+standard deviation of $\sqrt{0.05 \times 0.95/2000} \approx 0.005$;
+clustering inflates it to roughly $0.01$--$0.015$, so cells within about
+$\pm 0.03$ of the target are noise. Cells at $0.123$ and $0.149$ are not
+noise --- they are seven to ten standard deviations out.
+
+\textbf{Our numbers.} Additive design, first era [1969,1991): SON $0.149$,
+JJA $0.123$, MAM $0.074$, DJF $0.010$ --- the seasonal shape fitted as the
+131-year average does not match the first decades, so the threshold sits too
+low in summer--autumn and too high in winter there; later eras are close to
+target. Tensor design \code{te(doy, tt)}, same first era: SON $0.039$, JJA
+$0.039$, MAM $0.043$, DJF $0.012$; all 24 cells lie in $0.012$--$0.053$.
+
+\textbf{The concept behind the tensor.} Additive
+$f(\mathrm{doy}) + g(\mathrm{tt})$ means \emph{one} seasonal profile, the
+same in 1970 and 2095, shifted up or down by the trend. The tensor product
+builds a smooth surface from products of the two bases, so the freshet can
+arrive earlier, sharpen or flatten across the century --- which on a warming
+snowmelt river is precisely the expected physics. The additive model is a
+special case of the tensor, so nothing is lost by the generalisation, and the
+smoothing penalty (chosen by marginal likelihood) shrinks back toward the
+simpler shape unless the data pay for the extra freedom.
+
+\textbf{What to say.} ``The additive threshold fails your local-5\% test in
+the first era; letting the seasonal shape itself drift --- a one-line change
+of formula --- repairs every cell. I propose adopting the tensor design.''
+
+\subsection{Station 4: the GP tail}
+\label{sec:gp}
+
+\textbf{What is shown.} A table (route, exceedance count, shape $\hat\xi$,
+trend test), the fitted scale $\sigma(t)$ averaged by era, and two boxplot
+panels: raw excesses by month, and excesses divided by the fitted
+$\sigma(t)$, by month.
+
+\textbf{Why generalized Pareto and nothing else.} The Pickands--Balkema--de
+Haan theorem: for essentially any underlying distribution for which maxima
+have a limit law, the distribution of the \emph{excess over a high
+threshold}, $X-u$ given $X>u$, converges as the threshold rises to a
+generalized Pareto distribution,
+\[
+\Pr\{X_t > x \mid X_t > u(t), t\}
+= \Bigl(1 + \xi\,\frac{x-u(t)}{\sigma(t)}\Bigr)_{\!+}^{-1/\xi}
+\qquad \text{(v8~\S2.2, eq.~(4), p.~3).}
+\]
+That is the licence to model only the tail and to extrapolate beyond the
+data: the GP is not one convenient choice among many, it is the only
+continuous limit available. The threshold is our moving $u(t;0.95)$, so the
+theorem is applied date by date.
+
+\textbf{Reading the two parameters.} $\sigma(t)$ is the typical overshoot
+size at date $t$ --- a trend in it says floods are growing. $\xi$ is the
+tail-weight: $\xi > 0$ heavy-tailed with no upper limit (Pareto-like);
+$\xi = 0$ exponential; $\xi < 0$ a \emph{finite} upper end point at
+$u + \sigma/|\xi|$. Letting $\xi$ move with $t$ would claim the character of
+the tail is changing --- a far stronger claim than growth --- and $\xi$ is the
+hardest parameter to estimate, so it is held constant per series (the
+Faulkner et al.\ decision).
+
+\textbf{Our numbers.} Exceedances 2264 / 2236 / 2299. Shapes
+$\hat\xi = 0.038$ (NTHMB sf), $0.118$ (BRIDG sf), $-0.058$ (BRIDG bf) ---
+quote these when asked; with $\sim 2250$ exceedances the standard error is
+roughly $(1+\xi)/\sqrt{n} \approx 0.025$ before clustering inflation, so all
+three are within a couple of standard errors of the exponential boundary
+$\xi = 0$: moderately light tails, no evidence of wild heavy-tailedness.
+Scale trends: likelihood-ratio statistics $108.2$, $35.4$, $89.3$ on one
+degree of freedom --- all far beyond any conventional threshold ($\chi^2_1$
+at the 0.001 level is 10.8). NTHMB's mean scale by era: $29.0 \to 63.7$ ---
+the typical overshoot more than doubles; BRIDG rises $8.5$ to a
+mid-century $13.8$ then eases to $12.0$; baseflow $0.73 \to 2.1 \to 1.7$.
+
+\textbf{The two boxplots, and what each proves.} Raw excesses by month show
+strong seasonality --- freshet overshoots are physically larger --- which is
+why $\sigma$ must be seasonal. Excesses \emph{divided by} the fitted
+$\sigma(t)$ should be month-free if the seasonal scale absorbed it: the boxes
+are level, which is the professor's ``excesses no longer seasonal'' check
+passing in the body. The outliers are not level --- winter months contain
+standardized excesses far larger than summer's --- which is the tail story
+below.
+
+\textbf{Question: ``is the constant shape defensible?''} Here is the honest
+answer, with its diagnostic. Refit the GP per season on the standardized
+excesses: DJF $\hat\xi = 0.271$ ($n = 478$), MAM $0.193$, JJA $-0.180$, SON
+$0.051$. Winter is heavier-tailed than summer, and the same signal appears
+independently in the seasonal Exp(1) panels (the DJF excesses bow above the
+line) and in the standardized-excess outliers. Per-season standard errors are
+roughly $0.06$ before clustering inflation, so DJF versus JJA is a real
+contrast, not noise --- but freeing $\xi$ by season is a modelling decision
+with real cost (short winter records, harder identifiability), and it should
+be made with the professor, not slipped in.
+
+\subsection{Station 5: the uniformity gate, in full}
+\label{sec:pit}
+
+This is the gate of the whole analysis (v8~\S3, p.~4), it is the check the
+professor named, and every follow-up question about it has a precise answer.
+
+\subsubsection{The theorem: why correct margins force a uniform histogram}
+\label{sec:pitthm}
+
+\textbf{The probability integral transform.} If a continuous random variable
+$X$ has distribution function $F$, then $U = F(X)$ is Uniform$(0,1)$. The
+proof is three lines: for $u \in (0,1)$,
+\[
+\Pr(U \le u) \;=\; \Pr\{F(X) \le u\} \;=\; \Pr\{X \le F^{-1}(u)\}
+\;=\; F\{F^{-1}(u)\} \;=\; u,
+\]
+and ``$\Pr(U \le u) = u$ for every $u$'' is the definition of Uniform$(0,1)$.
+The intuition: $F(x)$ asks ``what fraction of this distribution lies below
+$x$?'', and a random draw lands below its own 30th percentile exactly 30\% of
+the time, below its own 70th percentile exactly 70\% of the time --- at every
+level equally. Feeding a variable through its own distribution function
+erases the shape of the distribution and leaves pure rank.
+
+\textbf{The non-stationary version, which is our gate.} Every day $t$ owns a
+distribution $F(\cdot\,;t)$, and each day's value is pushed through \emph{its
+own day's} fitted function: $U_t = F(x_t;t)$. If the fitted margins are
+correct, then $U_t$ is Uniform$(0,1)$ for every single day --- a June freshet
+day and a February low-flow day become identically distributed --- and a
+mixture of uniforms is uniform, so the pooled sample of 47{,}847 values must
+look uniform. The contrapositive is the diagnostic: any deviation from
+flatness is an accusation that $F(\cdot\,;t)$ was wrong \emph{for some
+identifiable set of days}, and \ref{sec:pitband}--\ref{sec:pitmaps} are the
+instruments that identify the set.
+
+\textbf{Three fine points that questions tend to probe.}
+\begin{enumerate}
+\item \emph{Continuity is load-bearing.} If the data carry ties, $F$ has
+jumps and $F(X)$ has point masses --- the histogram would spike at the tied
+values' probabilities no matter how good the model. This is why the forensics
+of Station~\ref{sec:datagate} run first: for streamflow there are no ties;
+baseflow's 3\% tie mass is the one place a small spike would be data, not
+model.
+\item \emph{Uniformity is marginal, not joint.} The theorem makes each day's
+$U_t$ uniform; it says nothing about independence, and indeed consecutive
+$U_t$ are strongly dependent --- a wet week is a week of high ranks. This
+does not move the target (flat at 1); it inflates the \emph{noise} around
+the target, quantified next.
+\item \emph{The check is slightly in-sample.} The same days that built
+$\hat F$ are pushed through it, and a quantile fit calibrates its own rung
+shares by construction, so the pooled histogram flatters the fit a little at
+the rung levels. The sliced views, the era maps and the rung audit are what
+keep the check honest; a fully out-of-sample version (transform each year
+through a fit that excluded it) is a possible refinement, not currently
+needed.
+\end{enumerate}
+
+\subsubsection{The histogram: what a bar is, how flat is flat, and why 40 bins}
+\label{sec:pitbars}
+
+\textbf{What a bar is.} With bins of width $w = 1/40 = 0.025$, the bar over a
+bin plots $\text{count}/(n\,w)$, so a perfectly uniform sample gives every
+bar height 1 \emph{in expectation}. The red line at 1 is that expectation.
+
+\textbf{How much a bar may wobble.} Under \emph{independent} days the bin
+count is Binomial$(n, w)$ with $n = 47{,}847$: mean $nw \approx 1196$,
+standard deviation $\sqrt{nw(1-w)} \approx 34$, so the bar height has
+standard deviation $34/1196 \approx 0.029$ and a $\pm 2$-SD range of about
+$\pm 0.06$. But the days are not independent: flow persists, so the $U_t$
+move in runs of several days, and clustered counts have variance inflated by
+roughly the mean run length. With runs of 4--8 days the standard deviation
+multiplies by $\sqrt{4}$--$\sqrt{8} \approx 2$--$3$, giving honest
+fluctuation of roughly $\pm 0.15$ per bar. \emph{So ``most bars between 0.85
+and 1.15'' is what a correct model looks like at this sample size}; demanding
+every bar touch 1 would be demanding less noise than 47{,}000 dependent days
+can deliver. The run-length arithmetic is an order-of-magnitude argument ---
+which is why the report does not rely on it, but computes the noise band
+empirically (next).
+
+\textbf{Why 40 bins, and why not more.} Bar noise scales like
+$1/\sqrt{n\,w}$: halve the width (80 bins) and the iid noise grows to
+$\pm 0.08$, with clustering to roughly $\pm 0.2$; at 400 bins each bar holds
+$\sim 120$ days and the display is pure noise. Go the other way (10 bins) and
+the bars are quiet ($\pm 0.03$) but blind to any feature narrower than $0.1$
+in probability. Forty is a display-resolution choice, not a law: width
+$0.025$ matches the spacing of the ladder's own bottom rungs, so one bar
+roughly interrogates one rung interval. And the same theorem is checked at
+two other resolutions: the \textbf{QQ plot is the bin-free version} --- it
+compares all 47{,}847 order statistics against their reference positions, no
+binning at all --- and the \textbf{rung audit is the exact version} at the
+thirteen fitted probabilities: the share of days at or below $u(t;\tau_k)$
+minus $\tau_k$, at most $0.006$ in absolute value everywhere in our run, with
+the only systematic entries at the bottom ($-0.006$, $-0.005$, $-0.005$ at
+$\tau = 0.01$: the 1\% rung sits slightly low --- the known difficulty of
+extreme quantile levels, and the cause of the short first bar).
+
+\subsubsection{The band figure: a noise interval on every bar}
+\label{sec:pitband}
+
+\textbf{The question each blue segment answers:} \emph{how much would this
+bar move if history had dealt us a different set of years?}
+
+\begin{Verbatim}[fontsize=\small]
+STEP 1  compute the observed 40 bar heights once
+STEP 2  repeat 200 times:
+          draw 131 year labels with replacement from {1969, ..., 2099}
+          keep the days of the drawn years        # whole years: the block
+          recompute the 40 bar heights on this replicate
+STEP 3  for each bar: the segment spans the 2.5% and 97.5% quantiles
+        of its 200 replicate heights
+STEP 4  flag (red dot) every bar whose whole segment sits off 1
+\end{Verbatim}
+
+\textbf{Why whole years are the resampling unit.} The noise to be measured
+comes from serial dependence --- flood clusters, wet seasons --- and a year is
+the natural block that keeps a full seasonal cycle and its clusters intact.
+Resampling single days would destroy exactly the dependence that creates the
+noise and produce a band that is too narrow (the iid $\pm 0.06$), flagging
+noise as structure.
+
+\textbf{How to read the figure.} Grey bars: observed heights. Blue segments:
+the year-block interval per bar. Red line: the target 1. Red dots: bars
+whose interval excludes 1 --- deviations that no plausible re-draw of years
+repairs, i.e.\ structural; those are the bars the residual maps then
+attribute. Two honesty notes. First, $\hat F$ is not refit inside each
+replicate, so the band measures sampling variability of the days, not
+uncertainty of the fit --- the right yardstick for ``is this bar's deviation
+year-to-year luck.'' Second, the implemented draw keeps a drawn year once
+even when it is drawn twice, a subsampling flavour of the bootstrap that
+makes the bands slightly \emph{wider} than the exact multiset version --- the
+conservative direction for a diagnostic (it flags too few bars, never too
+many).
+
+\subsubsection{The residual maps: attributing every off bar}
+\label{sec:pitmaps}
+
+\textbf{The construction.} A contingency table: rows are slices (the 12
+months, or the 6 eras), columns are the 40 bins, and the cell count $O$ is
+``how many January days landed in bin $(0.025, 0.050]$.'' The null
+hypothesis --- margins correct --- says each slice spreads \emph{its own}
+days evenly over the bins, so the expected count is
+$E = (\text{row total})/40$. The colour of a cell is the Pearson standardized
+residual
+\[
+R \;=\; \frac{O - E}{\sqrt{E}},
+\]
+approximately standard normal under the null (row totals put $E$ near 100
+per month cell, near 200 per era cell): white $\approx 0$ is perfect, red is
+too many days, blue is too few. $|R| \le 2$ is ordinary noise; because
+serial clustering inflates cell noise and 480 cells bring multiplicity (the
+largest of 480 null residuals is around 3 by chance alone), the working rule
+is that $|R| \ge 4$ is structure --- and the eye should look for
+\emph{stripes}, not lone cells.
+
+\textbf{The reading rule --- this is the point of the figure.} A horizontal
+stripe along a \emph{month} row means that month is systematically
+mis-transformed: residual seasonality, the one outcome the professor's
+verdict forbids. A vertical stripe down a \emph{bin} column means one rung is
+miscalibrated for all months alike: a ladder-tuning matter, not seasonality.
+A stripe along an \emph{era} row means drift the slow basis missed. The map
+therefore does not just detect non-uniformity --- it \emph{classifies its
+cause}.
+
+\textbf{Our numbers.} No month row shows a stripe --- the seasonal complaint
+is answered. The largest cells: BRIDG, era $[1969,1991)$ at the top bin,
+$R = +15.2$ --- too many first-era days counted as extreme, the same
+first-era threshold miscalibration the local 5\% table shows and the tensor
+design repairs; NTHMB, January at bin $(0.025, 0.050]$, $R = +7.1$, a
+bottom-rung neighbourhood effect consistent with the low 1\% rung; NTHMB,
+era $[2013, 2035)$ at the bottom bin, $R = -7.5$, the same rung read by era.
+
+\textbf{What to say.} ``The PIT is uniform to within the sampling noise that
+47{,}000 serially dependent days allow, in each season and each era
+separately; the report tests every bar against its own year-block noise band
+and attributes every genuine deviation --- and what survives is not
+seasonal: it is the slightly-low 1\% rung and the first-era threshold level,
+both identified and both with a named repair.''
+
+\subsection{Station 6: the dependence model and the model-free evidence}
+\label{sec:depclaim}
+
+\textbf{The model in words.} On the common Laplace scale, write $Y_C$ for the
+conditioning station and $Y_X$ for the associated one. Given that $Y_C$ is
+extreme ($Y_C = y > v$), the model says
+\[
+Y_X \;=\; a(t)\,y \;+\; y^{b(t)}\bigl\{m(t) + s(t)\,Z\bigr\},
+\qquad Z \sim G
+\]
+(v8~\S5, eq.~(8), p.~11). Read it as: when one river is extreme at rarity
+$y$, the other typically reaches the fraction $a(t)$ of that rarity, with
+scatter growing like $y^{b(t)}$, and the leftover randomness $Z$ carries no
+formula --- it is represented by the residuals the data themselves produced.
+The form is not arbitrary: Heffernan and Tawn showed that for essentially all
+standard dependence models, the correct normalisation of $Y_X$ given
+$Y_C = y$ large is location $a\,y$ and scale $y^{b}$ --- so the parametric
+part is the \emph{shape theory dictates}, and everything data-driven lives in
+the four curves and the residual distribution.
+
+\textbf{Why $a$ is the number that matters.} At $a=1, b=0$ the model reads
+$Y_X \approx Y_C + Z$: asymptotic dependence --- the link that never fades
+however extreme the event. $a=0, b=0$ is exact independence. Everything
+strictly between is asymptotic independence with strength $a$; the Gaussian
+copula with correlation $\rho$ sits at $a = \rho^2$, $b = \tfrac12$. On the
+Laplace scale both tails are exponential, so a single form covers negative
+association too ($a \in [-1,1]$; Keef et al.\ 2013). Because $a$ is a
+function of $t$, the model can say the \emph{class} of dependence is
+changing --- which is the paper's thesis, and Case~4 was selected because the
+screening said exactly that.
+
+\textbf{The model-free evidence, before any fitting.} The windowed
+$\chi(0.95)$: in each six-year window, count the days on which \emph{both}
+stations exceed their own pooled 95th percentile, divide by the days in the
+window, divide by 0.05. This estimates
+$\Pr\{\text{BRIDG extreme} \mid \text{NTHMB extreme}\}$ from ranks alone:
+independence gives 0.05/0.05 $\to$ it hovers near $0.05/0.05 \cdot 0.05
+= 0.05$ divided by 0.05, i.e.\ the value $0.05$ shown as the dashed line
+after normalisation; perfect dependence gives 1. Ours climbs from $0.253$
+(mean of the first ten windows) to $0.403$ (last ten). \emph{The joint
+extremes are becoming more frequent, and no model was involved in saying
+so.} This is the yardstick every fitted dependence result must face.
+
+\subsection{Station 7: the conditional-simulation display, in full}
+\label{sec:pseudo}
+
+This figure carries the most explanation per square centimetre, so it gets
+the same four-part treatment as the uniformity gate: what it tests, the
+generator with its distribution theory, how to read every visual feature,
+and the display decisions. If you can present this section, the functionals
+of Station~\ref{sec:funcs} come free, because they are readings off the same
+generated cloud.
+
+\subsubsection{What the figure claims to test}
+
+The fitted dependence model is a machine for answering ``given NTHMB is
+extreme, what does BRIDG do?'' The pseudosample figure runs that machine
+\emph{forward}: it manufactures synthetic days from nothing but the fitted
+parameters and the stored residuals, and overlays them on the real days. Two
+properties are then visible to the naked eye. \emph{Agreement}: where data
+exist, the synthetic cloud should live where the data live --- same centre,
+same spread, same tilt. \emph{Extrapolation}: beyond the largest observed
+events the cloud keeps going, and that extension is precisely what the model
+would answer if asked about a 200-year event --- shown, so its plausibility
+can be judged, rather than asserted inside an integral. This is Heffernan and
+Tawn's own Figure~3 device, and it is the eye's version of goodness-of-fit
+for a conditional model.
+
+\subsubsection{The generator, step by step, with the theory}
+
+\textbf{Step 1: draw the conditioning value.} We need $Y_C$ from its
+distribution \emph{given} $Y_C > v$. Two facts make this exact. First, after
+the marginal transform, $Y_C$ is standard Laplace, whose upper tail is
+$\Pr(Y > y) = \tfrac12 e^{-y}$ for $y > 0$ --- exactly exponential. The
+exponential is memoryless, so the excess above any threshold $v \ge 0$ is
+itself standard exponential: $\Pr(Y > v + w \mid Y > v) = e^{-w}$. Second,
+the inverse-CDF method: if $U$ is Uniform$(0,1)$ then
+$\kappa + (1-\kappa)U$ is Uniform$(\kappa, 1)$, and pushing it through the
+Laplace quantile function gives
+\[
+\Pr\bigl[q_{\mathrm{Lap}}\{\kappa + (1-\kappa)U\} \le y\bigr]
+= \frac{F_{\mathrm{Lap}}(y) - \kappa}{1-\kappa},
+\]
+which \emph{is} the conditional CDF of $Y_C$ given $Y_C > v$ (with
+$v = q_{\mathrm{Lap}}(\kappa)$, $\kappa = 0.95$, $v = 2.303$). No
+approximation: the draw is from the fitted marginal law restricted to the
+exceedance region.
+
+\textbf{Step 2: draw the residual --- and why the residual table exists.}
+During fitting, for every historical day on which the conditioning station
+exceeded $v$, the model equation is solved backwards:
+\[
+z \;=\; \frac{\bigl(y_X - a(t)\,y_C\bigr)/y_C^{\,b(t)} - m(t)}{s(t)} ,
+\]
+i.e.\ subtract the fitted level, divide by the fitted growth factor, remove
+the residual location and scale. What remains is how far that day sat above
+or below its fitted expectation, in standard units, with the effects of
+rarity and date both removed. These numbers --- one per historical extreme
+day, 2264 of them --- \emph{are} the estimate of $G$. No density is fitted to
+them, deliberately: a parametric $G$ would smooth away exactly the tail
+irregularities that matter, while the empirical table keeps every skewness
+and heavy-tail feature the rivers actually produced. Generation samples one
+row with replacement. The licence for reusing a 1975 residual at a 2095 date
+is the model's load-bearing assumption --- after the four curves remove the
+covariate effect, the residual law no longer depends on $t$ --- and that
+assumption is testable and tested: the residual-by-era boxplots must show
+equal boxes, and the residual-versus-$y_C$ scatter must show a flat running
+mean (both in the report).
+
+\textbf{Step 3: assemble at a chosen date.} Evaluate the four curves at one
+day --- reference year $Y$, day-of-year 187, the freshet peak --- and compute
+$y_X = a\,y_C + y_C^{\,b}(m + s\,z)$. Every circle is one repetition of
+steps 1--3; the panels draw 600.
+
+\textbf{Step 4 (original-scale figure only): push back to flow units.} A
+simulated $y_X$ is converted to a probability $p = F_{\mathrm{Lap}}(y_X)$ and
+then through the \emph{inverse} of that day's fitted marginal:
+below-threshold probabilities invert the ladder interpolation, $p > 0.95$
+inverts the GP tail, $p < 0.01$ inverts the exponential lower piece. This is
+the same $F(\cdot\,;t)$ machinery as the transform, run backwards, so the
+marginal calendar (freshet high, winter low, later years shifted) is restored
+exactly.
+
+\subsubsection{The Laplace-scale panel, element by element}
+
+The panel titled ``model pseudosample of $(Y_C, Y_X)$, year 2034.''
+
+\textbf{The axes.} Both variables after the per-day marginal transform, in
+standard Laplace units --- the units of \emph{rarity for that day of that
+year}. Zero is a median day for its date; $2.30$ is the top 5\% for its
+date; $+5$ or $+9$ is far tail. The point of these axes: the calendar is
+gone --- a February day and a July day, a 1970 day and a 2095 day, are
+directly comparable, because each was judged against its own day's
+distribution.
+
+\textbf{The grey cloud (all 47{,}847 days).} A diamond-shaped cloud centred
+at $(0,0)$ --- the Laplace shape, exponential in both directions --- tilted
+up-to-the-right: positive association surviving the transform, at all
+levels, not only extremes. Its symmetric, centred look is itself evidence
+that the margins were removed correctly (a wrong transform would displace or
+bend it). The upper reach ($\sim +11$) exceeds the lower ($\sim -5$):
+extreme high flows go deeper into their tail than droughts do here.
+
+\textbf{The dashed vertical line at $v = 2.303$.} The dependence threshold
+--- the Laplace image of the 0.95 level, a \emph{single flat number valid
+for every day}, possible only because the transform absorbed the
+non-stationarity. The model claims nothing left of this line, which is why
+no circles appear there: absence by construction, not failure.
+
+\textbf{The blue circles (600 generated pairs, year 2034).} The year is the
+axis midpoint --- the most stable region of the fitted curves; it enters
+only through $a, b, m, s$, since these axes carry no calendar. Their
+anatomy:
+\begin{itemize}
+\item \emph{Dense at the line, thinning rightward}: the conditioning value
+is threshold plus an Exp(1) draw --- mass decays like $e^{-w}$ beyond $v$
+--- matching how the grey points themselves thin to the right.
+\item \emph{Their centre rises only gently with $x$}: the gentle rise
+\emph{is} $\hat a \approx 0.095$ under the current fit; the vertical width
+is $s$ times the residual table's spread, widening slowly because
+$\hat b \approx 0.43$.
+\item \emph{Circles at low $y$, even below zero}: not an error --- the
+finding. Asymptotic independence means BRIDG can be an unremarkable day
+while NTHMB is extreme, and the grey data right of the line show the same
+low points. A model forcing every circle high would be claiming asymptotic
+dependence, which this pair does not have.
+\item \emph{The occasional very high circle} (near $(5, 9)$): a heavy
+residual drawn from the table --- the empirical $G$ kept the rivers' real
+skewed, heavy residuals, which a fitted Gaussian would have erased.
+\item \emph{The agreement test, by eye}: compare circles with grey points
+in the same $x$-range --- same centre, same spread, same skew. Circles
+reaching $x \approx 8$--$9$, where the grey points run out, are the
+extrapolation, on display.
+\end{itemize}
+
+\textbf{The honest caveat belonging to this panel.} These circles were
+generated under the dependence fit that Section~\ref{sec:defect} shows never
+left its starting value ($\hat a$ flat at 0.095). The cloud still overlays
+the data credibly because $m$, $s$ and the empirical residuals absorb much
+of what a mis-estimated $a$ leaves behind --- which is exactly why the eye
+test alone cannot settle $a$-versus-$m$, and why the optimiser repair plus
+the bootstrap, not this picture, will carry the trend claim.
+
+\subsubsection{The original-scale figure, element by element}
+
+The figure titled ``model pseudosamples on the original scale, day-of-year
+187, years 1975 and 2095,'' with both axes logarithmic.
+
+\textbf{Why log axes.} The flows span three orders of magnitude (BRIDG 0.5
+to $\sim 300$, NTHMB 10 to $\sim 1500$); linear axes would crush the cloud
+into a corner. On log axes equal \emph{ratios} are equal distances --- so a
+cloud that looks compact on the right actually spans a wide absolute range.
+
+\textbf{The grey cloud.} Three features worth naming. It rises diagonally:
+association at all levels. It is made of fine \emph{parallel threads},
+clearest lower-left: recession curves --- consecutive days of one storm or
+melt event trace a smooth trajectory as both rivers drain, one thread per
+event, made visible by the log scale. And it has \emph{broad branches}
+rather than one ellipse: rising-limb, falling-limb and different seasons
+occupy slightly different tracks (hysteresis) --- a reminder that the body
+of the joint distribution is complicated, which is why the model only
+claims the conditional tail.
+
+\textbf{The black triangles (one per year).} For each of the 131 years, the
+day NTHMB hit its annual maximum, plotted at that day's (NTHMB, BRIDG)
+pair; they pile up at NTHMB $\approx 500$--$1100$, BRIDG $\approx
+80$--$250$. They exist for one reason: the meeting's complaint was that
+simulated points came out smaller than real extremes, so the real extreme
+days are put on the plot and the clouds must land on and extend their
+territory --- checkable by eye. (The stray low triangle near $(350, 40)$: a
+weak flood year, real, not an error.)
+
+\textbf{The blue circles (year 1975, day 187).} Each is one run of the
+generator with both coordinates pushed back through \emph{that day's}
+inverse marginals. Two visible properties: the column is \emph{narrow in
+$x$} --- the conditioning draw concentrates just above the threshold
+(exponential decay of mass) and 1975's day-187 margin maps that
+concentration into a tight band starting at the day's 95th percentile
+($\sim 650$); and its \emph{vertical spread} ($\sim 80$--$250$) matches the
+triangles' spread --- the calibration check passing.
+
+\textbf{The red circles (year 2095, same day).} Everything that differs
+from blue is the fitted change across the century: the cloud shifts
+\emph{right} (NTHMB's margin intensifies --- threshold slope $+61.8$ per
+unit axis, GP scale $29 \to 64$), stretches into territory with no grey
+dots --- the extrapolation, displayed --- and rises slightly. Honest note to
+volunteer if pressed: with the current stuck fit $a(t)$ is flat, so nearly
+all visible blue-to-red movement is the \emph{margins} changing; the
+dependence component joins after the optimiser repair.
+
+\textbf{One-sentence summaries.} Laplace panel: ``on the common rarity
+scale, the model's synthetic extreme days --- parameters plus recycled
+residuals only --- are statistically indistinguishable from the real days
+where data exist, and beyond the data they show exactly the extrapolation
+the model would use for rarer events.'' Original scale: ``the same synthetic
+days placed on the real flow scale at the freshet peak of an early and a
+late year: they sit where the real annual-maximum days sit, and the red
+cloud is what the fitted century of change does to a co-flood.''
+
+\subsubsection{The display decisions, each with its reason}
+
+\textbf{Why the conditioning day is the freshet peak (day 187).}
+Conditioning on a randomly picked date lands mostly in low-flow seasons; the
+back-transform then returns modest flows, and the simulated points come out
+smaller than the real annual extremes --- precisely the complaint raised in
+the meeting. Real annual maxima occur on particular days of the season, so a
+display meant to be compared with them must condition on the day of year.
+The original-scale figure overlays the observed annual-maximum days as black
+triangles so the comparison is checkable by eye: the clouds now land on and
+extend the triangles' territory.
+
+\textbf{Why no year colours on the standard-scale panel.} The marginal
+transform absorbs the year: after each day passes through its own day's
+distribution, all days follow the same Laplace law, so 1973 and 2094 are
+\emph{by construction} indistinguishable on those axes, and colouring them
+would draw a distinction the axes cannot carry. (The joint drift, if any,
+lives in $a(t), b(t)$ --- and is quantified by the fitted curves and the
+functionals, not by colours here.)
+
+\textbf{Why the year contrast is legitimate on the original scale.} There the
+margins genuinely differ by year --- the same Laplace pair maps to different
+flows in 1975 and 2095 --- so blue-versus-red carries real information: the
+whole fitted change, margins and dependence together. Which scale the paper
+should show is the open display question for the professor; the eventual
+headline is RCP~4.5 against RCP~8.5 on this same figure, once that export is
+in the pipeline.
+
+\textbf{Why years 1975, 2034 and 2095 --- deliberately not extreme
+years.} A display date has two coordinates chosen by different logic. The
+\emph{day-of-year} coordinate (187) is chosen to be extreme, on purpose and
+by computation, not by hand: it is the day at which the fitted threshold's
+climatological average peaks, so the simulation is comparable with real
+annual maxima. The \emph{year} coordinate is structural, not extreme:
+\code{start\_year + 6}, \code{round(mean(range(years)))} and
+\code{max(years) - 4} give 1975, 2034 and 2095 --- early, middle and late
+positions fixed by arithmetic before any result is seen. Why those
+positions: early-versus-late is the figure's job (same conditioning event,
+same day of year, only the year differs, so the blue-to-red difference is
+purely the fitted change); a few years \emph{inside} the axis ends because
+spline fits are least stable at boundaries; the middle year for the
+single-cloud panel because it is the most stable region and, on the
+standard scale, any year works almost by construction. The distinction
+matters: picking a year \emph{because it contained a famous flood} would be
+selection bias --- choosing the display after seeing outcomes; axis
+positions declared in advance are illustration (v8~\S6: ``choosing a date
+to display is illustration, not selection bias, provided the questions the
+figure answers are written down first''). And the conditioning \emph{value}
+is never chosen at all --- it is integrated over: $Y_C$ is drawn from the
+whole top-5\% region, so the display conditions on ``extreme,'' not on one
+historical event.
+
+\textbf{Monte Carlo error, in case it is asked.} With 600 circles the cloud's
+visual boundary wobbles; with the $n_{\mathrm{mc}} = 10{,}000$ draws used for
+the functionals, a probability near $0.35$ carries a Monte Carlo standard
+error of $\sqrt{0.35 \times 0.65/10{,}000} \approx 0.005$ --- negligible
+against everything else.
+
+\subsection{Station 8: return levels}
+\label{sec:rl}
+
+\textbf{The definition, and why it needs a reference year.} Under a trend
+there is no single ``100-year flood.'' Fix a station, a period $T$ and a
+reference year $Y$: freeze the fitted curves as they stand in year $Y$, let
+$M_Y$ be the annual maximum of a year with those parameters, and define
+$x_T(Y)$ by $\Pr\{M_Y > x_T(Y)\} = 1/T$ (v8~\S6, eq.~(10), p.~14). Every
+return-level statement is a probability statement about a year with a stated
+climate --- the waiting-time reading (``we will wait about $T$ years'') is
+false under a trend and is never used.
+
+\textbf{The construction, in three moves.} (i) For $x$ above the threshold on
+day $t$, the daily exceedance probability is the chance of being an
+exceedance day at all times the GP tail beyond $x$:
+$p(x,t) = 0.05 \times \{1 + \xi (x - u(t))/\sigma(t)\}_+^{-1/\xi}$
+(v8~eq.~(11)). (ii) Chain the days of year $Y$:
+$\Pr(M_Y \le x) = \prod_t \{1 - p(x,t)\}$ --- exact if days were
+independent. (iii) They are not: extremes arrive in clusters, so the year
+holds fewer independent opportunities than days, and the classical extremal
+index result says the dependent maximum behaves like the independent one
+raised to the power $\theta \in (0,1]$:
+$\Pr(M_Y \le x) \approx [\prod_t \{1-p(x,t)\}]^{\theta}$ (v8~eq.~(13),
+p.~15), where $1/\theta$ is the mean cluster length. Ignoring $\theta$
+overstates the annual exceedance probability and \emph{inflates} the return
+levels --- wrong even though it errs on the cautious side.
+
+\textbf{Our numbers.} $\hat\theta = 0.244$ at NTHMB (mean cluster 4.1 days),
+$0.127$ at BRIDG (7.9 days), with our implementation and
+\code{extRemes} agreeing to three decimals. The two computational routes ---
+root-finding on the formula versus simulating thousands of synthetic years
+and reading the empirical quantile --- agree to $0.26\%$, $0.32\%$, $0.98\%$
+at $T = 10, 50, 100$ when clustering is switched off, which validates the
+chaining machinery before the correction is trusted.
+
+\subsection{Station 9: the three conditional functionals}
+\label{sec:funcs}
+
+The professor's three summaries --- the conditional mean
+$\mathbb{E}(Y_t \mid X_t \ge x)$, the conditional quantiles, and the band
+probability $\Pr(a \le Y_t \le b \mid X_t \ge x)$ --- are all read off one
+generated cloud per reference year, produced by exactly the generator of
+Station~\ref{sec:pseudo} with $n_{\mathrm{mc}} = 10{,}000$: the mean is
+computed \emph{after} inverting to flow units (the mean does not commute with
+the nonlinear transform, so it must be taken on the flow scale); the
+quantiles are empirical quantiles of the generated flows; $P_{co}$ --- BRIDG
+above its own day's threshold while NTHMB is extreme --- needs no inversion
+at all, because on the Laplace scale the day's threshold is the same flat
+number $y^* = 2.303$ for every day, so it is just the fraction of the cloud
+above $y^*$; likewise $P_{band}$ with the band bounds at the day's marginal
+0.95 and 0.995 quantiles, which on the Laplace scale are the fixed numbers
+$2.303$ and $4.605$. All bounds and levels are declared parameters, because
+they were the professor's free choices.
+
+\textbf{Status.} The machinery is verified --- the model-generated
+conditional mean matches the plain empirical average over observed
+exceedance days to $0.5\%$ (early era) and $8.4\%$ (late era), the HT04
+Table-5 discipline --- but the values currently printed
+($P_{co} \approx 0.35$, flat in $t$) are computed from the stuck dependence
+fit of Section~\ref{sec:defect} and must be re-generated after the repair.
+Present the machinery, not the numbers.
+
+\subsection{Station 10: uncertainty}
+\label{sec:boot}
+
+Whole years are resampled with replacement, keeping each year's days together
+and in order --- the block that preserves within-year clustering --- and
+threshold, GP tail, extremal index and dependence model are \emph{refitted}
+inside every replicate; the spread of the recomputed quantities is the
+uncertainty band. This is different in kind from Station~5's band (years
+re-drawn, nothing refitted: a sampling-noise yardstick) and from Route~B
+(generation from a fitted model: Monte Carlo, not uncertainty). The knit runs
+$B = 25$ replicates for speed; the paper-scale run is $B = 2000$ with every
+data-driven selection (smoothing weights, model sizes, the lag) re-selected
+inside each replicate --- selection outside the loop makes bands too narrow,
+because it treats a chosen quantity as if it had been known in advance.
+
+\section*{Part II --- Inside the code}
+\addcontentsline{toc}{section}{Part II --- Inside the code}
+
+Every algorithm: what it computes, the pseudocode, why that is the right
+computation, and what verifies it. Where a published package does the work,
+what it does internally is explained --- ``we use qgam'' is not an
+explanation.
+
+\subsection{The one formula behind every parameter curve}
+
+Every parameter --- threshold, scale, the four dependence curves --- is one
+formula with different ingredients:
+\[
+\eta(t) = \sum_{k=1}^{p} \gamma_k B_k(t),
+\]
+where the $B_k$ are fixed, known basis functions chosen before fitting and
+the $\gamma_k$ are the only estimated quantities (v8~\S4.1, eq.~(7), p.~5).
+One column: a constant (the stationary model). Two columns $[1, t]$: a
+straight line. Cubic B-spline bumps at knots along the axis: the flexible
+curve. The bases are nested --- constant $\subset$ line $\subset$ spline ---
+which is what makes model-size comparison meaningful. A cubic B-spline bump
+is nonzero over only four knot intervals, rises to one peak, and returns to
+zero; at any date exactly four bumps are nonzero and they sum to one, so the
+curve at a date is a local weighted average of four coefficients, each
+estimated from the thousands of days under its own bump. Neighbours replace
+repeats; smoothness is the assumption that makes that legitimate. The
+seasonal component adds cyclic basis functions in day-of-year (period one
+year, derivatives matching across the year boundary); the tensor version
+multiplies the two bases into a surface.
+
+\subsection{The quantile ladder in code: qgam, line by line}
+\label{sec:qgamcode}
+
+The target is unchanged from Station~\ref{sec:threshold}: for each level
+$\tau$ in $\{0.01, 0.025, 0.05, 0.1, \ldots, 0.9, 0.95\}$, the curve
+minimising pinball loss plus roughness --- and minimising pinball loss
+\emph{is} quantile estimation, by the derivative identity proved there.
+What follows is every qgam-touching line, in the code-understanding format.
+
+\textbf{Entry 1: the model formula.}
+\begin{Verbatim}[fontsize=\small]
+fm <- list(y ~ s(doy, bs = "cc", k = 12) + s(tt, bs = "cr", k = 25),
+           ~ s(doy, bs = "cc", k = 8))
+\end{Verbatim}
+\code{s()} declares a smooth term in mgcv's language. \code{bs = "cc"} is
+the \emph{cyclic} cubic spline: the basis is built so the curve and its
+derivatives match across the year boundary --- December 31 joins January 1
+with no seam; one seasonal shape, learned from all 131 years at once.
+\code{bs = "cr"} is the ordinary cubic spline for the trend; $k = 25$ over
+131 years is a knot roughly every 5.5 years, matching the project's
+spacing decision. \textbf{What $k$ is and is not:} $k$ is the basis
+dimension --- a \emph{ceiling} on flexibility, not the flexibility itself;
+the actual wiggliness is chosen by the smoothing penalty (Entry 3), so a
+generous $k$ with automatic smoothing is the standard idiom. \textbf{The
+second formula is not a second quantile model}: it tells qgam how the
+conditional \emph{spread} of $y$ varies, because the smoothed loss has a
+per-observation bandwidth that must scale with local spread (Entry 3, step
+1). Flow variance is massively seasonal --- freshet days scatter over
+hundreds of units, winter days over a few --- so the variance model is
+cyclic in day-of-year. Omitting it is qgam's classic failure mode: a
+constant bandwidth gives the fitted 0.95 curve season-dependent bias
+(their own motorcycle-data figure demonstrates it).
+
+\textbf{Entry 2: the pass-through knots.}
+\begin{Verbatim}[fontsize=\small]
+argGam = list(knots = list(doy = c(0.5, 366.5)))
+\end{Verbatim}
+Everything in \code{argGam} goes to the internal \code{mgcv::gam} calls.
+This pins the cyclic boundary knots at half-days: the period is exactly 366
+days with the join \emph{between} Dec 31 and Jan 1. Without it, mgcv sets
+the cycle boundary at the observed data range (1 to 366), which would
+identify day 1 \emph{with} day 366 --- gluing New Year onto New Year's Eve
+as the same covariate value instead of neighbours.
+
+\textbf{Entry 3: the fit itself.}
+\begin{Verbatim}[fontsize=\small]
+fitM <- mqgam(fm, data = d, qu = taus, argGam = kn)
+\end{Verbatim}
+\code{mqgam} fits the model at all 13 levels, storing the shared components
+once (why it beats 13 \code{qgam} calls). Internally, in order:
+\begin{enumerate}
+\item \emph{Preliminary location--scale fit.} A Gaussian \code{gaulss} GAM
+of mean and variance (the variance from our second formula), plus a
+flexible density (sinh--arcsinh) for its standardized residuals. Purpose:
+the pinball loss has a kink, which blocks smooth optimisation; qgam
+replaces it with the smoothed \emph{ELF loss}, and the amount of smoothing
+is \emph{computed, not tuned} --- a formula minimising the asymptotic mean
+squared error of the coefficients, evaluated with this density estimate,
+giving a \emph{per-observation} bandwidth: wide in the freshet, narrow in
+winter. Their theoretical result: the optimally smoothed loss is
+statistically \emph{better} than the raw pinball, not merely convenient.
+\item \emph{Learning-rate calibration, per level} --- the expensive step
+and the printed dots (``\code{Estimating learning rate... qu = 0.5
+......done}''). The rate $1/\sigma_0$ balances loss against the smoothing
+prior; qgam selects it by Brent search where \emph{every dot is a complete
+penalized fit} at a trial $\sigma_0$, scored so that the intervals for the
+quantile curve achieve roughly their advertised coverage. This is why 13
+rungs $\times$ 5 series was slow: calibration, not fitting.
+\item \emph{Smoothing selection.} Given $\sigma_0$ and the bandwidth, the
+roughness weights $\lambda$ (one per \code{s()} term) are chosen by
+Laplace-approximate marginal likelihood --- the step that replaced our
+cross-validation loop at this stage (the head-to-head is
+Section~\ref{sec:qgamvscv}).
+\item \emph{Final fit} at the chosen $\sigma_0, \lambda$ by penalized
+iteratively re-weighted least squares --- mgcv's standard engine.
+\end{enumerate}
+Recorded costs, all handled by our code: no non-crossing constraint
+(Entry 5); calibration theory assumes independent data, so with 4--8-day
+clusters qgam's intervals are a working approximation and \emph{all} our
+uncertainty comes from the year-block bootstrap; and extreme-$\tau$ bias
+--- our rung audit shows exactly this cost, the $\tau = 0.01$ rung sitting
+$\sim 0.5\%$ low.
+
+\textbf{Entry 4: extracting the ladder.}
+\begin{Verbatim}[fontsize=\small]
+U <- sapply(taus, function(q) as.numeric(qdo(fitM, q, predict, newdata = d)))
+\end{Verbatim}
+\code{mqgam} stores its 13 fits stripped of shared components to save
+memory, so they cannot be used directly; \code{qdo} re-attaches the shared
+pieces to the level-$q$ fit and applies any standard gam function --- here
+\code{predict} on all 47{,}847 days. \code{sapply} stacks the 13 curves
+into the $N \times 13$ matrix $U$. Downstream, \emph{only $U$ is used} ---
+which is what makes the qgam route and the fallback interchangeable.
+
+\textbf{Entry 5: the non-crossing audit and repair.}
+\begin{Verbatim}[fontsize=\small]
+ncross <- sum(apply(U, 1, function(r) any(diff(r) <= 0)))
+if (ncross > 0) { Us <- t(apply(U, 1, sort))
+                  msize <- max(abs(Us - U)) / sd(x); U <- Us }
+\end{Verbatim}
+Per day, check the 13 rung values are strictly increasing; count the days
+with any violation; repair by sorting each day's rungs into order ---
+monotone rearrangement, which provably never increases estimation error
+(Chernozhukov, Fern\'andez-Val, Galichon 2010). \code{msize} records the
+largest change the sort made, in sd units --- the number separating
+``hairline overlaps'' from ``real fitting problem.'' Our run: 1147 / 1520 /
+1481 crossing days, largest repair 0.013 / 0.006 / 0.009 sd --- cosmetic.
+The returned \code{lam\_u = NA} marks that qgam kept its smoothing
+internal; downstream code checks for the NA.
+
+\textbf{Entry 6: the shell --- fallback and cache.} The \code{tryCatch}
+around the body degrades to the project \code{quantreg} fitter on any
+error, announced with \code{cat("NOTE: ...")} --- \code{cat}, not
+\code{message()}, because chunk options suppress messages and a silent
+fallback once hid a wrong route. The cache wrapper saves the result to
+\code{cache\_ladder\_<tag>\_<route>\_<N>\_<sum(x)>.rds}: the name carries
+the route and a data fingerprint, so changing the data, axis or route
+changes the filename and forces a refit automatically;
+\code{refit\_ladders: true} forces one manually; the knit prints which
+cache file it used --- provenance on the record.
+
+\textbf{Entry 7: the fast-calibration variant.}
+\begin{Verbatim}[fontsize=\small]
+cal <- tuneLearnFast(fm, data = d, qu = c(0.05, 0.50, 0.95), argGam = kn)
+lsig_of <- approxfun(c(0.05, 0.50, 0.95), cal$lsig, rule = 2)
+U <- sapply(taus, function(q) as.numeric(predict(
+       qgam(fm, data = d, qu = q, lsig = lsig_of(q), argGam = kn),
+       newdata = d)))
+\end{Verbatim}
+Entry 3's step 2 runs per rung and dominates the cost.
+\code{tuneLearnFast} runs \emph{only} that calibration, at three anchor
+levels; \code{approxfun} interpolates the selected $\log\sigma_0$ linearly
+in $\tau$ (the learning rate varies slowly and smoothly in $\tau$, which is
+what makes interpolation safe); passing \code{lsig} to \code{qgam} skips
+calibration entirely, so each rung is one plain fit. Net: 3 calibrations
+$+$ 13 fits instead of 13 calibrations --- a 3--4$\times$ cut, same model.
+
+\textbf{Entry 8: the tensor experiment.}
+\begin{Verbatim}[fontsize=\small]
+fte <- qgam(list(y ~ te(doy, tt, bs = c("cc","cr"), k = c(10, 15)),
+                 ~ s(doy, bs = "cc", k = 8)),
+            data = d, qu = 0.95, argGam = kn)
+\end{Verbatim}
+\code{te()} replaces ``seasonal shape $+$ trend'' with a smooth
+\emph{surface} in (day-of-year, year): the marginal bases (10 cyclic
+$\times$ 15 trend) are multiplied into 150 surface functions with
+\emph{separate} penalties in each direction --- two smoothing parameters,
+both by Entry 3's machinery --- cyclic in the doy direction only. The
+additive model is a special case of the surface, so nothing can be lost,
+and the smoothing shrinks back toward additivity unless the data pay for
+the interaction. Fitted at the single working level $\tau = 0.95$ (one
+calibration), cached under its own filename. This is the fit whose season
+$\times$ era table turned the first-era misses (0.149, 0.123) into 0.039
+--- the evidence for adopting it.
+
+\subsection{qgam versus blocked cross-validation: one problem, two philosophies}
+\label{sec:qgamvscv}
+
+Both routes estimate the same curve under the same loss; they differ in the
+criterion for one nuisance number, the roughness weight. The big picture in
+one sentence: \emph{cross-validation treats smoothing selection as a
+prediction experiment --- physically hold data out, measure pinball loss on
+it, keep the $\lambda$ that predicts best; qgam treats it as Bayesian
+inference --- translate the penalized problem into likelihood-plus-prior,
+then keep the $\lambda$ under which the observed data are most probable.}
+Everything qgam builds (the smoothed loss, the learning rate) exists to
+make that translation legitimate, because a raw loss is not a likelihood
+and Bayesian machinery may not touch it directly. Step by step:
+
+\textbf{Step 0, the target: identical.} The $\tau$-quantile curve, defined
+by the pinball identity. Nothing about the route changes what is estimated.
+
+\textbf{Step 1, the objective.} CV route: raw pinball $+$
+$\lambda\,\times$ squared differences of neighbouring coefficients. qgam:
+the same with the kink rounded off (ELF), the rounding set by the
+MSE-minimising formula with a per-observation bandwidth --- not a new knob,
+and provably an upgrade, not a compromise.
+
+\textbf{Step 2, the inner fit at fixed $\lambda$.} CV route: a linear
+program (\code{rq.fit.fnb} on the augmented design, penalty rows appended
+as pseudo-data). qgam: with a smooth loss, $\exp(-\mathrm{loss})$ behaves
+like a density, so the fit is penalized likelihood via iteratively
+re-weighted least squares. Same role, different solver, enabled by step 1.
+
+\textbf{Step 3, choosing $\lambda$ --- the head-to-head.} CV route: a grid
+of $\lambda$ times five year-block folds; fit on four fifths, score
+held-out pinball, average, argmin. Direct and model-free, but expensive,
+one $\lambda$ only (a two-dimensional grid times folds is unaffordable ---
+which is why our CV shares a single $\lambda$ across curves), and it stops
+at the grid edge (we hit that edge twice, at $10^4$ and $10^6$). qgam: the
+penalty is reinterpreted as a Gaussian \emph{prior} --- ``wiggly curves are
+improbable a priori,'' with $\lambda$ its precision; integrate the
+coefficients out and what remains is the \emph{marginal likelihood of
+$\lambda$ itself}: how probable the observed data are under each candidate
+smoothness, averaged over every curve that smoothness allows.
+Laplace-approximate the integral (LAML), maximise by Newton. No grid, no
+folds, no edges, and \emph{several} $\lambda$'s at once (seasonal, trend,
+the tensor's two). The bridge to what you know: maximising marginal
+likelihood is asymptotically close to optimising leave-out predictive
+performance --- the known REML--CV connection --- it reaches the same place
+by probability calculus instead of data splitting.
+
+\textbf{Step 4, the step CV does not have: the learning rate.} A true
+likelihood fixes the relative weight of data and prior by itself; a
+loss-based pseudo-likelihood has no natural scale ---
+$\exp(-\mathrm{loss}/\sigma_0)$ is equally valid for any $\sigma_0$, and
+$\sigma_0$ controls wiggliness and interval width. This is the price of the
+loss-to-likelihood translation (the Bissiri--Holmes--Walker belief-updating
+framework is its licence). qgam pins $\sigma_0$ by coverage calibration
+(the Brent search, the printed dots). Our CV route never needed this step
+because it never claimed intervals --- uncertainty was always the
+bootstrap's job; accordingly, the calibrated intervals are the one qgam
+output we deliberately do not use.
+
+\textbf{Step 5, serial dependence.} Our blocked folds exist \emph{because}
+of dependence: random folds leak a held-out day's neighbours into training
+and under-smooth. LAML has no folds, so no leakage of that form --- but it
+is not immune either: it counts every day as an independent contribution,
+overstating the effective sample size, with the same qualitative risk and
+definitely too-narrow intervals. \emph{Neither criterion handles our
+dependence honestly by itself}; on both routes the final authority is
+out-of-model --- the season $\times$ era tables --- and the year-block
+bootstrap for uncertainty.
+
+\textbf{Step 6, what stays ours on either route.} The rung grid, the basis
+design, the non-crossing audit and repair, the assembly into $F(x;t)$, and
+the verification ladder --- including the comparison of the two routes
+themselves.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{3.4cm}p{5.3cm}p{5.6cm}@{}}
+\toprule
+\textbf{Step} & \textbf{Our CV route} & \textbf{qgam's replacement} \\
+\midrule
+Loss & raw pinball & smoothed pinball (ELF); bandwidth by MSE formula
+$+$ variance model \\
+Inner fit & linear program (\code{rq}, augmented design) & penalized IRLS
+(loss now differentiable) \\
+Penalty's meaning & roughness term added to the loss & Gaussian
+\emph{prior} on coefficients \\
+$\lambda$ selection & grid $\times$ year-block folds, held-out pinball &
+marginal likelihood (LAML), Newton, several $\lambda$'s at once \\
+Data-vs-penalty weight & implicit, absorbed in $\lambda$ & explicit
+learning rate $\sigma_0$, set by coverage calibration \\
+Dependence & blocked folds & nothing built in --- bootstrap and
+out-of-model tables cover it \\
+Uncertainty & block bootstrap (external) & calibrated intervals (built in;
+deliberately unused here) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The honest closing symmetry, if asked ``which is right'': neither, by
+authority. Where the two routes disagree --- top-rung mean gap 0.166 sd ---
+the referee is not preference but the out-of-model calibration tables,
+where the qgam route with the tensor design currently wins.
+
+\subsection{Blocked cross-validation --- where it still runs, and why blocked}
+
+qgam and evgam select their own smoothing; cross-validation remains only
+where no package covers our criterion (our GP fallback fitter; the
+dependence stage). It selects one number, $\lambda$:
+
+\begin{Verbatim}[fontsize=\small]
+STEP 1  assign whole YEARS to K = 5 folds, round robin (1969->1, 1970->2, ...)
+STEP 2  for each candidate lambda in a grid:
+          for each fold k: fit on the other folds, score the pinball or
+          negative log-likelihood on fold k alone; average the K scores
+STEP 3  keep the lambda with the smallest average held-out score
+\end{Verbatim}
+
+Whole years, because flood days come in 4--8-day runs: with random-day folds
+the neighbours of a held-out day sit in the training set carrying nearly the
+same information, the held-out score is optimistic for wiggly fits, and CV
+systematically under-smooths. Blocking puts an entire cluster on one side of
+every split. Limitation, stated up front: CV answers ``what predicts best''
+and can never certify a trend --- the penalty's null space (constants under a
+first-difference penalty) is invisible to it --- so significance belongs to
+move one, never to $\lambda$.
+
+\subsection{Model size: the two moves}
+
+\textbf{Move one, constant versus linear} --- the only step that can say ``a
+trend exists.'' The test matches the stage's criterion. GP tail: a genuine
+likelihood, so the likelihood-ratio statistic
+$\Lambda = 2(\hat\ell_{\text{lin}} - \hat\ell_{\text{const}})$ is compared to
+$\chi^2_1$ (Wilks: under the null, twice the log-likelihood gain from one
+extra free parameter is $\chi^2_1$). Threshold: no likelihood exists, so the
+slope is judged against its block-bootstrap standard error. Dependence: the
+likelihood is a working device, so its $\Lambda$ is only a guide and the
+honest test is the bootstrap interval for the slope. \textbf{Move two, linear
+versus spline}: no separate test --- the penalised spline contains the line,
+so if the fitted spline collapses to a straight shape, the line is reported
+and the spline kept as robustness.
+
+\subsection{The GP tail fit}
+
+\begin{Verbatim}[fontsize=\small]
+INPUT   excesses (x - u(t)) on the ~2250 days above the threshold
+MODEL   log sigma(t) = cyclic seasonal + trend spline   (log => sigma > 0)
+        xi = one constant per series
+FIT     maximise sum of GP log-densities + roughness penalty on the trend
+\end{Verbatim}
+Production: \code{evgam}, \code{family = "gpd"}, REML smoothing. Our own
+penalised-likelihood fitter runs alongside for the constant-vs-linear LRT and
+as the consistency check: relative gaps 0.185 / 0.363 / 1.010 --- the large
+baseflow value is two smoothing philosophies disagreeing where $\sigma$ is
+tiny (a relative measure inflates), reported not hidden.
+
+\subsection{From two pieces to one distribution; the Laplace map; the inverse}
+
+$F(x;t)$ is assembled per day (v8~\S3, eq.~(5), p.~3): linear interpolation
+between rung values in the body; the GP tail above the top rung (continuous
+by construction, since $F = 0.95$ at the threshold on every day); an
+exponential lower piece below the bottom rung, slope-matched so the lower
+tail decays instead of clipping (the old hard clamp at $10^{-5}$ collapsed
+the lowest days onto one point at $-2.44$ and drew a flat-run-and-jump QQ
+artifact; the instrumented rebuild prints 0 days at the numerical floor).
+Then the Laplace map $y = \log(2F)$ for $F < \tfrac12$,
+$-\log\{2(1-F)\}$ otherwise (v8~eq.~(6), p.~4). Why Laplace: both tails
+exactly exponential and symmetric, so one parametric dependence form covers
+positive and negative association ($a \in [-1,1]$), where the Gumbel scale
+of the 2004 paper covers positive only. The inverse $q_{\mathrm{inv}}(p;t)$
+runs the same assembly backwards (ladder inverse in the body, GP quantile
+above, exponential inverse below) and is what returns simulated values to
+flow units.
+
+\subsection{The dependence fitter, the Keef constraint, and the defect}
+\label{sec:defect}
+
+\textbf{The objective.} Writing $\mu_i = a(t_i) y_{C,i} + m(t_i)
+y_{C,i}^{b(t_i)}$ and $\sigma_i = s(t_i)\, y_{C,i}^{b(t_i)}$, minimise over
+the exceedance days
+\[
+\sum_i \Bigl[\log \sigma_i + \tfrac12\{(y_{X,i} - \mu_i)/\sigma_i\}^2\Bigr]
+\;+\; \text{roughness penalties},
+\]
+the negative log of a working Gaussian likelihood. The Gaussian is a scoring
+device, not a belief --- Keef et al.\ tested Normal against Laplace working
+residuals and kept the Normal --- and the residual is stored as a table, never
+believed normal. Links: $a = 2\,\mathrm{plogis}(\eta_a) - 1 \in (-1,1)$;
+$b < 1$ enforced; $s = e^{\eta_s} > 0$.
+
+\textbf{The Keef constraint (v8~\S5, eq.~(9), p.~13).} An unconstrained fit
+can extrapolate conditional quantiles \emph{above what perfect positive
+dependence would give} --- a self-contradiction. The ordering constraint
+forbids it, checked at a level $v_K$ above the largest observed conditioning
+value, because extrapolation is what needs policing.
+
+\textbf{The defect, precisely.} The constraint was implemented as a hard
+wall: objective $= 10^{10}$ outside the feasible set. BFGS estimates
+gradients by finite differences; when trial steps land on the wall the
+gradient is garbage and the search stops at its starting point. Evidence:
+all three model sizes returned the identical objective 2698.6; the trend
+statistic was exactly 0.00 with $\hat a$ flat at 0.095; switching the wall
+off dropped the objective to 2022.2 (a 676-unit gap --- not a constraint
+biting mildly) and produced $\hat a(t): 0.396 \to 0.490$, rising. So the
+reported constrained fit is the starting value, not an optimum. One
+corollary: \emph{every} constrained linear/spline number in this knit is
+suspect --- including the freshet-only linear endpoints ($0.443 \to -0.245$),
+fitted through the same wall; the freshet number that is reliable is the
+constant $\hat a = 0.227$.
+
+\textbf{What the answer probably looks like.} The unconstrained trend
+($0.40 \to 0.49$) and the model-free windowed $\chi$ ($0.253 \to 0.403$)
+agree in level and direction. And the constant fit --- which was seeded
+sensibly --- agrees with texmex's constrained reference ($a$: 0.095 vs
+0.081; $b$: 0.425 vs 0.402), so the constraint machinery is sound in
+principle; only the wall is unusable by a gradient method.
+
+\textbf{The repair.}
+\begin{Verbatim}[fontsize=\small]
+violation(a,b) = size of the ordering breach (0 when feasible)
+objective      = working criterion + penalties + kappa * violation^2
+fit            = Nelder-Mead first (derivative-free), BFGS to polish,
+                 from several starts incl. the unconstrained solution
+report         = the violation at the solution (zero = feasible, printed)
+\end{Verbatim}
+
+\textbf{The second finding, independent of the defect.} Constant fits per
+season of the conditioning day: JJA $\hat a = 0.172$, MAM $0.141$, SON
+$-0.011$, DJF $-0.055$. The association lives in the freshet; winter
+``extremes'' (extreme \emph{for the season}) carry none. Because the seasonal
+threshold spreads conditioning days across all seasons ($537$--$599$ per
+season), a pooled $\hat a$ mixes these regimes and is diluted toward zero ---
+the freshet-only constant is $0.227$ against the pooled $0.095$. Whether the
+science question is season-relative extremes or flood-season extremes is a
+decision for the professor; the numbers show it changes the answer.
+
+\subsection{The verification ladder, in one place}
+
+The answer to ``how do I know the code is right'' --- six independent checks,
+all printed in the report:
+\begin{enumerate}
+\item qgam ladder vs our penalised \code{quantreg} ladder: 0.166 sd.
+\item evgam tail vs our penalised likelihood: 0.185 / 0.363 / 1.010.
+\item Our all-constant dependence fit vs \code{texmex} on its own defaults
+(Laplace margins, Keef constraints), both given the identical transformed
+pair so the margins cancel: $a$ 0.095 vs 0.081, $b$ 0.425 vs 0.402.
+\item With $b$ frozen and curves linear, our fitter vs
+\code{mgcv::gam(gaulss)} on literally the same model: conditional means agree
+to $3.4 \times 10^{-5}$ of the data range.
+\item Route A root-finding vs Route B simulation: $\le 1\%$.
+\item The known-answer case: the Case 1 anchor pair must return $\hat a$
+near 1; it returns 1.000.
+\end{enumerate}
+Plus \code{extRemes} $\equiv$ our Ferro--Segers to three decimals, and the
+HT04 Table-5 check: model-generated vs empirical conditional mean, 0.5\% and
+8.4\% by era.
+
+\section*{Part III --- Question drill}
+\addcontentsline{toc}{section}{Part III --- Question drill}
+
+\textbf{``Why quantile regression for the threshold?''} A fixed level is a
+different rarity in different seasons and decades, so its exceedances are not
+comparable events; fixing the probability and moving the level makes
+``extreme'' mean rarity 0.05 on every date --- and minimising the pinball
+loss \emph{is} quantile estimation, by the derivative identity
+$\frac{d}{du}\mathbb{E}\rho_\tau = F(u) - \tau$.
+
+\textbf{``How is the smoothing chosen?''} Automatically: marginal likelihood
+with a calibrated learning rate at the threshold (qgam), REML at the tail
+(evgam), blocked cross-validation where no package covers the criterion. The
+hand-set quantities are declared design choices: the rung grid, knot
+spacing, basis sizes.
+
+\textbf{``Why whole-year folds and blocks?''} Days cluster in 4--8-day runs;
+random folds leak a held-out day's neighbours into training, bias the score,
+and under-smooth. Years are the natural block containing whole clusters and
+whole seasonal cycles.
+
+\textbf{``Why should $F(x_t;t)$ be uniform?''} The probability integral
+transform: a continuous variable through its own CDF lands below its
+$u$-quantile with probability exactly $u$ --- the definition of uniformity.
+Each day uses its own day's fitted CDF, and a mixture of uniforms is
+uniform (Section~\ref{sec:pitthm}).
+
+\textbf{``Why 40 bars / why are bars not all at 1?''} Resolution choice;
+bar noise $\propto 1/\sqrt{n \times \mathrm{width}}$: $\pm 0.06$ iid,
+$\approx \pm 0.15$ with clustering. Bars are tested against year-block
+resampling intervals, not against the eye
+(Sections~\ref{sec:pitbars}--\ref{sec:pitband}).
+
+\textbf{``What is the heatmap?''} Pearson residuals $(O-E)/\sqrt{E}$ of a
+slice-by-bin table; month stripe = seasonality, column stripe = a rung, era
+stripe = drift. Ours shows no month stripe (Section~\ref{sec:pitmaps}).
+
+\textbf{``What exactly is $a$?''} The fraction of the conditioning station's
+rarity that the other station typically attains on a common standardised
+scale: 1 asymptotic dependence, 0 independence, Gaussian copula at $\rho^2$;
+time-varying $a$ is the paper's question (Section~\ref{sec:depclaim}).
+
+\textbf{``Where do the simulated points come from?''} An exact draw from the
+fitted marginal restricted to the exceedance region (Laplace tail is
+memoryless), a residual recycled from the historical table, assembled through
+the fitted curves at a chosen date, optionally inverted to flow units ---
+Section~\ref{sec:pseudo}, four steps, each with its theory.
+
+\textbf{``Why do the circles only appear right of the dashed line?''} The
+model is defined only for conditioning values above $v$; the left region is
+not modelled, so no circles belong there.
+
+\textbf{``What would a bad fit look like in the pseudosample figure?''}
+Circles systematically above or below the data cloud (wrong $a$ or $m$),
+circles fanning wider or narrower than the data (wrong $b$ or $s$), or a
+symmetric cloud against visibly skewed data (a parametric $G$ would do this;
+the empirical table is why ours does not).
+
+\textbf{``Why condition on day-of-year 187?''} Because annual extremes occur
+on freshet days; conditioning on a random date compares simulated low-season
+days against observed annual maxima and loses --- the complaint from the
+meeting, fixed by design and checkable via the overlaid triangles.
+
+\textbf{``Why years 1975, 2034 and 2095?''} The day of year is chosen to
+be extreme --- the climatological freshet peak, computed from the fitted
+threshold --- so the simulation is comparable with real annual maxima; the
+years are early, middle and late axis positions fixed by arithmetic in
+advance. Representative dates, not selected events: picking a year for its
+famous flood would be selection bias, and changing these is a one-line
+parameter.
+
+\textbf{``CV or qgam --- which is right?''} Both estimate the same curve
+under the same loss; they differ only in the criterion for one nuisance
+number (Section~\ref{sec:qgamvscv}). Where they disagree --- 0.166 sd at
+the top rung --- the referee is the out-of-model calibration table, where
+the tensor-qgam route wins.
+
+\textbf{``Is $\xi$ constant defensible?''} A decision, with the diagnostic on
+the table: per-season $\hat\xi$ = DJF 0.271, MAM 0.193, JJA $-0.180$, SON
+0.051 --- winter heavier, consistent across three independent views, worth a
+deliberate discussion rather than a silent change.
+
+\textbf{``Why is the dependence trend not significant?''} It is not yet
+tested: the constrained optimiser never left its starting point (identical
+objectives, exactly zero statistic), so the flat $\hat a(t)$ measures the
+optimiser. The model-free $\chi$ rises 0.25 $\to$ 0.40 and the unconstrained
+fit rises 0.40 $\to$ 0.49; the constrained refit with a smooth penalty is the
+outstanding fix.
+
+\textbf{``What is the strongest single sentence the marginal stage
+supports?''} ``At every series the high quantile and the overshoot scale are
+rising significantly, the threshold is calibrated locally by season and era,
+and the transform passes its uniformity gate in every slice --- so the
+marginal intensification result stands on checks, not assumptions.''
+
+\section*{Part IV --- The fix list}
+\addcontentsline{toc}{section}{Part IV --- The fix list}
+
+\begin{enumerate}
+\item \textbf{Dependence optimiser (blocking).} Smooth penalty in place of
+the wall; Nelder-Mead then BFGS; multiple starts including the unconstrained
+solution; print the violation at the solution. Until then, no
+dependence-stage number is quotable --- including the functionals.
+\item \textbf{Adopt the tensor threshold.} The local table settles it:
+first-era misses 0.149 / 0.123 become 0.039 / 0.039.
+\item \textbf{Decide the conditioning question} with the professor:
+season-relative extremes (current) or flood-season extremes (freshet-only).
+The per-season table shows the choice changes the answer.
+\item \textbf{Lift the $\tau = 0.01$ rung} (or re-tune the bottom of the
+ladder) so the below-rung share matches its nominal 1\%.
+\item \textbf{Raise the bootstrap} to $B = 2000$ with selections inside the
+loop, once the dependence fit is trustworthy.
+\item \textbf{Bring in RCP 8.5}, turning the year contrast into the scenario
+contrast the display was rebuilt for.
+\end{enumerate}
+
+\end{document}
